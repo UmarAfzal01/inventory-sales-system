@@ -18,55 +18,56 @@ export default function DashboardPage() {
   const [selectedBranch, setSelectedBranch] = useState("ALL");
   const [selectedType, setSelectedType] = useState("ALL");
   const [selectedStatus, setSelectedStatus] = useState("ALL");
+  // "rollup" = served from the pre-aggregated cache. "live-scan" = the cache is
+  // Set when the rollups have never been built, so the dashboard can say what
+  // to do instead of silently showing zeros.
+  const [setupNeeded, setSetupNeeded] = useState(false);
 
   useEffect(() => {
-    fetchAllDashboardData();
+    const controller = new AbortController();
+
+    const load = async () => {
+      setLoading(true);
+      try {
+        const queryParams = new URLSearchParams({
+          branch: selectedBranch,
+          type: selectedType,
+          sellingStatus: selectedStatus,
+        }).toString();
+
+        // One request. This used to fan out to four endpoints, three of which
+        // each streamed the entire products collection into the server to sum
+        // it there.
+        const res = await fetch(`/api/dashboard?${queryParams}`, {
+          signal: controller.signal,
+        }).then((r) => r.json());
+        if (res.needsBackfill) {
+          setSetupNeeded(true);
+          return;
+        }
+        if (!res.success) throw new Error(res.error || "Dashboard request failed");
+
+        setSetupNeeded(false);
+        setStats(res.stats);
+        setFilters(res.filtersList);
+        setCategoriesData(res.categories);
+      } catch (err) {
+        // A superseded request is not an error worth surfacing.
+        if (err.name === "AbortError") return;
+        console.error("Dashboard fetch error:", err);
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+          setHasLoadedOnce(true);
+        }
+      }
+    };
+
+    load();
+    // Cancel in-flight work when filters change again, so a slow earlier
+    // response cannot overwrite a newer one.
+    return () => controller.abort();
   }, [selectedBranch, selectedType, selectedStatus]);
-
-  const fetchAllDashboardData = async () => {
-    setLoading(true);
-    try {
-      const queryParams = new URLSearchParams({
-        branch: selectedBranch,
-        type: selectedType,
-        sellingStatus: selectedStatus,
-      }).toString();
-
-      const [filtersRes, salesRes, inventoryRes, categoriesRes] = await Promise.all([
-        fetch(`/api/dashboard/filters?${queryParams}`).then((r) => r.json()),
-        fetch(`/api/dashboard/sales?${queryParams}`).then((r) => r.json()),
-        fetch(`/api/dashboard/inventory?${queryParams}`).then((r) => r.json()),
-        fetch(`/api/dashboard/categories?${queryParams}`).then((r) => r.json()),
-      ]);
-
-      setStats({
-        totalProducts: filtersRes.success ? filtersRes.data.totalProducts : 0,
-        totalInventory: inventoryRes.success ? inventoryRes.data.totalInventory : 0,
-        totalSales: salesRes.success ? salesRes.data.totalSales : 0,
-        positiveSales: salesRes.success ? salesRes.data.positiveSales : 0,
-        negativeSales: salesRes.success ? salesRes.data.negativeSales : 0,
-        negativeStock: inventoryRes.success ? inventoryRes.data.negativeStock : 0,
-        zeroStock: inventoryRes.success ? inventoryRes.data.zeroStock : 0,
-      });
-
-      if (filtersRes.success) {
-        setFilters({
-          branches: filtersRes.data.branches,
-          types: filtersRes.data.types,
-          statuses: filtersRes.data.statuses,
-        });
-      }
-
-      if (categoriesRes.success) {
-        setCategoriesData(categoriesRes.data);
-      }
-    } catch (err) {
-      console.error("Dashboard fetch error:", err);
-    } finally {
-      setLoading(false);
-      setHasLoadedOnce(true);
-    }
-  };
 
   const formatNumber = (val) => {
     if (loading && !hasLoadedOnce) return "—";
@@ -98,6 +99,12 @@ export default function DashboardPage() {
               <span className={`w-2 h-2 rounded-full ${loading ? "bg-amber-500" : "bg-emerald-500 animate-ping"}`}></span>
               {loading ? "Updating Metrics..." : "Live Sync Active"}
             </span>
+            {setupNeeded && (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-800 border border-amber-200 shadow-sm">
+                <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+                Summary data not built yet
+              </span>
+            )}
           </div>
         </div>
 
