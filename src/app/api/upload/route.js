@@ -4,6 +4,12 @@ import Product from "@/models/Product";
 import { foldUpload, commitUpload, refreshDerived } from "@/lib/rollups";
 import * as XLSX from "xlsx";
 
+export const runtime = "nodejs";
+// Parsing the sheet and bulk-writing is slow on its own, and the route now also
+// refreshes the dashboard rollups (~12s) before responding. Serverless platforms
+// read this from the build output; without it the default timeout kills uploads.
+export const maxDuration = 300;
+
 export async function POST(req) {
   try {
     await dbConnect();

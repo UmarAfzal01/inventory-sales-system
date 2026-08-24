@@ -151,7 +151,11 @@ export async function rebuildCounts(branches) {
 
   const branchExpr = (branchList) => ({
     $let: {
-      vars: { st: { $ifNull: ["$stock", {}] } },
+      // Read the stock map once as {k, v} pairs. Looking branches up by
+      // filtering this array — rather than $getField with a dynamic field name —
+      // keeps the pipeline working on MongoDB 7.x, where $getField requires a
+      // constant field. Atlas 8.0 accepts both; older clusters do not.
+      vars: { arr: { $objectToArray: { $ifNull: ["$stock", {}] } } },
       in: {
         $concatArrays: [
           {
@@ -160,15 +164,32 @@ export async function rebuildCounts(branches) {
               as: "b",
               in: {
                 $let: {
-                  vars: { v: { $getField: { field: "$$b", input: "$$st" } } },
+                  vars: {
+                    v: {
+                      $let: {
+                        vars: {
+                          hit: {
+                            $first: {
+                              $filter: {
+                                input: "$$arr",
+                                as: "e",
+                                cond: { $eq: ["$$e.k", "$$b"] },
+                              },
+                            },
+                          },
+                        },
+                        in: { $ifNull: ["$$hit.v", null] },
+                      },
+                    },
+                  },
                   in: {
                     branch: "$$b",
                     // A missing reading is neither negative nor zero, and the
-                    // guard must be a type check. $getField on an absent key
-                    // yields undefined, which sorts BELOW null in BSON order —
-                    // so both `undefined != null` and `undefined < 0` are true,
-                    // and a null-guard would count every unstocked product as
-                    // negative.
+                    // guard must be a type check rather than a null check: an
+                    // absent key yields undefined, which sorts BELOW null in
+                    // BSON order, so both `undefined != null` and
+                    // `undefined < 0` are true. A null-guard would count every
+                    // unstocked product as negative stock.
                     neg: { $cond: [{ $and: [{ $isNumber: "$$v" }, { $lt: ["$$v", 0] }] }, 1, 0] },
                     zero: { $cond: [{ $and: [{ $isNumber: "$$v" }, { $eq: ["$$v", 0] }] }, 1, 0] },
                   },
@@ -179,7 +200,7 @@ export async function rebuildCounts(branches) {
           [
             {
               $let: {
-                vars: { vals: { $map: { input: { $objectToArray: "$$st" }, as: "e", in: "$$e.v" } } },
+                vars: { vals: { $map: { input: "$$arr", as: "e", in: "$$e.v" } } },
                 in: {
                   branch: ALL,
                   neg: {
