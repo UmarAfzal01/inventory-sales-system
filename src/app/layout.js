@@ -22,7 +22,49 @@ export default function RootLayout({ children }) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex bg-[#F8FAFC] text-slate-800">
+        {/* PERSISTENT SIDEBAR */}
+        <aside className="w-72 bg-white border-r border-slate-200 hidden md:flex flex-col shrink-0 select-none">
+          <div>
+            {/* Sidebar Top Badge */}
+            <div className="p-5 border-b border-slate-100">
+              <span className="inline-block px-2.5 py-1 bg-indigo-50 text-indigo-600 text-[10px] font-extrabold rounded uppercase tracking-wider">
+                Headquarter
+              </span>
+              <h2 className="text-base font-bold text-slate-900 mt-2">Rainbow AI Portal</h2>
+              <p className="text-xs text-slate-400 mt-0.5">User: hq_admin</p>
+            </div>
+
+            {/* Navigation Menu */}
+            <div className="p-4">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 px-3 mb-2">Overview</div>
+              <div className="space-y-1">
+                <a href="/dashboard" className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-indigo-50/70 text-indigo-600 text-xs font-semibold">
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-600"></span>
+                  Inventory Overview
+                </a>
+                <a href="/dashboard" className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-600 text-xs font-medium hover:bg-slate-50 cursor-pointer">
+                  Sales Overview
+                </a>
+              </div>
+
+              <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 px-3 mt-6 mb-2">Upload</div>
+            </div>
+          </div>
+
+          {/* Sign Out Button */}
+          <div className="p-4 border-t border-slate-100">
+            <button className="w-full py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-lg transition-colors flex items-center justify-center gap-2">
+              <span>Sign Out</span>
+            </button>
+          </div>
+        </aside>
+
+        {/* MAIN PAGE CONTENT */}
+        <main className="flex-1 min-w-0 overflow-y-auto">
+          {children}
+        </main>
+      </body>
     </html>
   );
 }
