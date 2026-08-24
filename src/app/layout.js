@@ -22,41 +22,53 @@ export default function RootLayout({ children }) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex bg-[#F8FAFC] text-slate-800">
-        {/* PERSISTENT SIDEBAR */}
-        <aside className="w-72 bg-white border-r border-slate-200 hidden md:flex flex-col shrink-0 select-none">
-          <div>
-            {/* Sidebar Top Badge */}
-            <div className="p-5 border-b border-slate-100">
-              <span className="inline-block px-2.5 py-1 bg-indigo-50 text-indigo-600 text-[10px] font-extrabold rounded uppercase tracking-wider">
-                Headquarter
-              </span>
-              <h2 className="text-base font-bold text-slate-900 mt-2">Rainbow AI Portal</h2>
-              <p className="text-xs text-slate-400 mt-0.5">User: hq_admin</p>
-            </div>
+      <body className="min-h-full flex bg-gradient-to-br from-slate-100 via-blue-50/40 to-indigo-50/50 text-slate-800">
+        {/* PERSISTENT SIDEBAR - Glassmorphism Theme */}
+        <aside className="w-72 bg-white/40 backdrop-blur-3xl border-r border-white/60 shadow-[20px_0_50px_rgba(0,0,0,0.03)] hidden md:flex flex-col shrink-0 select-none relative overflow-hidden">
+          
+          {/* Subtle Ambient Glow inside Sidebar */}
+          <div className="absolute -top-20 -left-20 w-48 h-48 bg-blue-400/15 rounded-full blur-3xl pointer-events-none"></div>
+          <div className="absolute -bottom-20 -right-20 w-48 h-48 bg-indigo-400/15 rounded-full blur-3xl pointer-events-none"></div>
 
-            {/* Navigation Menu */}
-            <div className="p-4">
-              <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 px-3 mb-2">Overview</div>
-              <div className="space-y-1">
-                <a href="/dashboard" className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-indigo-50/70 text-indigo-600 text-xs font-semibold">
-                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-600"></span>
-                  Inventory Overview
-                </a>
-                <a href="/dashboard" className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-600 text-xs font-medium hover:bg-slate-50 cursor-pointer">
-                  Sales Overview
-                </a>
+          <div className="relative z-10 flex flex-col h-full">
+            <div>
+              {/* Sidebar Top Badge */}
+              <div className="p-6 border-b border-white/40">
+                <span className="inline-block px-3 py-1 bg-blue-500/10 border border-blue-500/20 text-blue-600 text-[10px] font-extrabold rounded-full uppercase tracking-wider shadow-sm">
+                  Headquarter
+                </span>
+                <h2 className="text-base font-extrabold text-slate-900 mt-2.5 tracking-tight">Rainbow AI Portal</h2>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">User: hq_admin</p>
               </div>
 
-              <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 px-3 mt-6 mb-2">Upload</div>
-            </div>
-          </div>
+              {/* Navigation Menu */}
+              <div className="p-4 space-y-6">
+                <div>
+                  <div className="text-[11px] font-extrabold uppercase tracking-wider text-slate-400 px-3 mb-2">Overview</div>
+                  <div className="space-y-1">
+                    <a href="/dashboard" className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-2xl bg-blue-500/10 border border-blue-500/30 text-blue-700 text-xs font-bold shadow-[0_4px_15px_rgba(37,99,235,0.08)] backdrop-blur-md">
+                      <span className="w-2 h-2 rounded-full bg-blue-600 shadow-[0_0_8px_rgba(37,99,235,0.8)]"></span>
+                      Inventory Overview
+                    </a>
+                    <a href="/dashboard" className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-2xl text-slate-600 text-xs font-semibold hover:bg-white/50 hover:text-slate-900 transition backdrop-blur-sm">
+                      Sales Overview
+                    </a>
+                  </div>
+                </div>
 
-          {/* Sign Out Button */}
-          <div className="p-4 border-t border-slate-100">
-            <button className="w-full py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-lg transition-colors flex items-center justify-center gap-2">
-              <span>Sign Out</span>
-            </button>
+                <div>
+                  <div className="text-[11px] font-extrabold uppercase tracking-wider text-slate-400 px-3 mb-2">Upload</div>
+                  {/* Additional links can go here */}
+                </div>
+              </div>
+            </div>
+
+            {/* Sign Out Button */}
+            <div className="mt-auto p-4 border-t border-white/40 bg-white/20 backdrop-blur-md">
+              <button className="w-full py-3 bg-white/60 hover:bg-white/90 border border-white/80 text-slate-700 font-bold text-xs rounded-2xl transition-all shadow-[0_4px_15px_rgba(0,0,0,0.04)] flex items-center justify-center gap-2 backdrop-blur-md">
+                <span>Sign Out</span>
+              </button>
+            </div>
           </div>
         </aside>
 
