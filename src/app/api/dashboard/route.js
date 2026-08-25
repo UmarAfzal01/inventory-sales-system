@@ -1,31 +1,37 @@
 import { NextResponse } from "next/server";
+import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
-import { readDashboard } from "@/lib/rollups";
+import { ensureSchema } from "@/lib/schema";
+import { parseIsoDate } from "@/lib/ingest";
+import { readDashboard } from "@/lib/warehouse";
 
 export const runtime = "nodejs";
 
 /**
- * The whole dashboard: headline stats, per-category breakdown, filter options.
+ * The whole dashboard: headline stats, category breakdown, filter options.
+ * Reads only the pre-aggregated cubes — never the fact tables.
  *
- * Reads only the pre-aggregated rollups, which uploads maintain incrementally.
- * Nothing here touches the `products` collection.
+ * Params: branch, type, sellingStatus, from, to (yyyy-mm-dd, inclusive).
  */
 export async function GET(req) {
   try {
     await dbConnect();
+    await ensureSchema(mongoose.connection.db);
 
-    const { searchParams } = req.nextUrl;
+    const q = req.nextUrl.searchParams;
     const data = await readDashboard({
-      branch: searchParams.get("branch") || "ALL",
-      type: searchParams.get("type") || "ALL",
-      sellingStatus: searchParams.get("sellingStatus") || "ALL",
+      branch: q.get("branch") || "ALL",
+      type: q.get("type") || "ALL",
+      sellingStatus: q.get("sellingStatus") || "ALL",
+      from: parseIsoDate(q.get("from")),
+      to: parseIsoDate(q.get("to")),
     });
 
     if (!data.ready) {
       return NextResponse.json({
         success: false,
-        needsBackfill: true,
-        error: "Dashboard data has not been built yet. Run POST /api/dashboard/refresh once.",
+        needsUpload: true,
+        error: "No data yet. Upload a sales or inventory sheet to get started.",
       });
     }
 

@@ -13,52 +13,56 @@ export default function FileUpload({ isOpen, onClose }) {
 
   const fileInputRef = useRef(null);
 
-  const [year, setYear] = useState("2026");
-  const [month, setMonth] = useState("AUG-26");
-  const [day, setDay] = useState("22");
+  // Inventory sheets carry no date columns, so the operator supplies one.
+  // A single ISO date replaces the old Year / Month / Day text boxes, which the
+  // server ignored entirely — every snapshot ended up filed under the same day.
+  const [snapshotDate, setSnapshotDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [errors, setErrors] = useState([]);
 
-  // Close modal on pressing ESC key
+  // Close modal on pressing ESC key — but not while a request is in flight, for
+  // the same reason the close button is disabled: dismissing the dialog does not
+  // cancel the upload, it just hides it.
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && !loading) onClose();
     };
     if (isOpen) {
       window.addEventListener("keydown", handleKeyDown);
     }
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, loading]);
 
-  // Infinite/smooth indeterminate progress ticker until request resolves
+  // Indeterminate progress ticker that runs until the request resolves.
+  // The first value is set inside the timer rather than synchronously in the
+  // effect body: a synchronous setState here triggers a cascading render, which
+  // React's lint rules flag.
   useEffect(() => {
-    let timer;
     if (loading) {
-      setProgress(10);
-      timer = setInterval(() => {
-        setProgress((oldProgress) => {
-          if (oldProgress >= 95) return 95;
-          const diff = 95 - oldProgress;
-          const increment = Math.max(Math.floor(diff * 0.1), 1);
-          return oldProgress + increment;
+      const timer = setInterval(() => {
+        setProgress((prev) => {
+          if (prev === 0) return 10;
+          if (prev >= 95) return 95;
+          return prev + Math.max(Math.floor((95 - prev) * 0.1), 1);
         });
-      }, 200);
-    } else {
-      setProgress(100);
-      timer = setTimeout(() => setProgress(0), 400);
+      }, 120);
+      return () => clearInterval(timer);
     }
-    return () => {
-      clearInterval(timer);
-      clearTimeout(timer);
-    };
+
+    const timer = setTimeout(() => setProgress(0), 400);
+    return () => clearTimeout(timer);
   }, [loading]);
 
   if (!isOpen) return null;
 
   const handleFileChange = (selectedFile) => {
     if (selectedFile) {
-      if (!selectedFile.name.match(/\.(xlsx|xls)$/i)) {
-        alert("Please select a valid Excel file (.xlsx or .xls).");
+      // A first-pass convenience check only — the server re-validates the file's
+      // actual contents, since a rename defeats any check based on the name.
+      if (!selectedFile.name.match(/\.(xlsx|xlsm|xls|csv)$/i)) {
+        setErrors([`"${selectedFile.name}" is not a spreadsheet. Choose an .xlsx, .xls or .csv file.`]);
         return;
       }
+      setErrors([]);
       setFile(selectedFile);
       setPreviewData(null);
     }
@@ -88,12 +92,14 @@ export default function FileUpload({ isOpen, onClose }) {
 
     setLoading(true);
     setMessage("");
+    setErrors([]);
     setPreviewData(null);
 
     const formData = new FormData();
     formData.append("file", file);
     formData.append("fileType", fileType);
     formData.append("action", "preview");
+    if (fileType === "inventory") formData.append("snapshotDate", snapshotDate);
 
     try {
       const res = await fetch("/api/upload", {
@@ -106,10 +112,11 @@ export default function FileUpload({ isOpen, onClose }) {
         setProgress(100);
         setPreviewData(data.summary);
       } else {
-        setMessage(`Error: ${data.error}`);
+        // Header validation returns a list; everything else a single message.
+        setErrors(data.errors?.length ? data.errors : [data.error || "Could not read this file."]);
       }
     } catch (err) {
-      setMessage(`Network error: ${err.message}`);
+      setErrors([`Network error: ${err.message}`]);
     } finally {
       setLoading(false);
     }
@@ -118,17 +125,13 @@ export default function FileUpload({ isOpen, onClose }) {
   const handleConfirmUpload = async () => {
     setLoading(true);
     setMessage("");
+    setErrors([]);
 
     const formData = new FormData();
     formData.append("file", file);
     formData.append("fileType", fileType);
     formData.append("action", "upload");
-
-    if (fileType === "inventory") {
-      formData.append("year", year);
-      formData.append("month", month);
-      formData.append("day", `DAY${day}`);
-    }
+    if (fileType === "inventory") formData.append("snapshotDate", snapshotDate);
 
     try {
       const res = await fetch("/api/upload", {
@@ -142,11 +145,15 @@ export default function FileUpload({ isOpen, onClose }) {
         setMessage(data.message);
         setPreviewData(null);
         setFile(null);
+        // The dashboard fetches its own data on the client, so nothing would
+        // otherwise tell it new figures exist — you had to reload the page.
+        // It listens for this and refetches in place.
+        window.dispatchEvent(new CustomEvent("inventory:data-updated"));
       } else {
-        setMessage(`Error: ${data.error}`);
+        setErrors(data.errors?.length ? data.errors : [data.error || "Upload failed."]);
       }
     } catch (err) {
-      setMessage(`Network error: ${err.message}`);
+      setErrors([`Network error: ${err.message}`]);
     } finally {
       setLoading(false);
     }
@@ -157,10 +164,14 @@ export default function FileUpload({ isOpen, onClose }) {
       {/* Modal Container - Pure White Theme */}
       <div className="relative w-full max-w-xl max-h-[90vh] overflow-y-auto p-8 space-y-6 rounded-[36px] bg-white border border-slate-100 shadow-[0_25px_50px_rgba(0,0,0,0.1)]">
         
-        {/* Close Widget Button */}
+        {/* Close Widget Button. Disabled mid-request: closing the dialog does not
+            cancel the upload, so letting it close mid-write hides an operation
+            that is still running against the database. */}
         <button
           onClick={onClose}
-          className="absolute top-6 right-6 w-9 h-9 rounded-full bg-slate-100 hover:bg-slate-200 text-gray-700 flex items-center justify-center transition shadow-xs z-20"
+          disabled={loading}
+          title={loading ? "Please wait until the upload finishes" : "Close"}
+          className="absolute top-6 right-6 w-9 h-9 rounded-full bg-slate-100 hover:bg-slate-200 text-gray-700 flex items-center justify-center transition shadow-xs z-20 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-100"
         >
           ✕
         </button>
@@ -184,11 +195,12 @@ export default function FileUpload({ isOpen, onClose }) {
             <div className="grid grid-cols-2 gap-3">
               <button
                 type="button"
+                disabled={loading}
                 onClick={() => {
                   setFileType("sale");
                   setPreviewData(null);
                 }}
-                className={`flex items-center space-x-3 p-3.5 rounded-2xl border text-left transition ${
+                className={`flex items-center space-x-3 p-3.5 rounded-2xl border text-left transition disabled:opacity-50 disabled:cursor-not-allowed ${
                   fileType === "sale"
                     ? "bg-blue-50 border-blue-200 shadow-xs text-blue-900"
                     : "bg-slate-50/60 border-slate-200 hover:bg-slate-100/80 text-gray-700"
@@ -213,11 +225,12 @@ export default function FileUpload({ isOpen, onClose }) {
 
               <button
                 type="button"
+                disabled={loading}
                 onClick={() => {
                   setFileType("inventory");
                   setPreviewData(null);
                 }}
-                className={`flex items-center space-x-3 p-3.5 rounded-2xl border text-left transition ${
+                className={`flex items-center space-x-3 p-3.5 rounded-2xl border text-left transition disabled:opacity-50 disabled:cursor-not-allowed ${
                   fileType === "inventory"
                     ? "bg-blue-50 border-blue-200 shadow-xs text-blue-900"
                     : "bg-slate-50/60 border-slate-200 hover:bg-slate-100/80 text-gray-700"
@@ -245,44 +258,25 @@ export default function FileUpload({ isOpen, onClose }) {
           {fileType === "inventory" && (
             <div className="bg-slate-50 border border-slate-200/80 p-4 rounded-2xl space-y-3">
               <h4 className="text-xs font-extrabold text-blue-900 uppercase tracking-wide">
-                Target Snapshot Date
+                Stock Count Date
               </h4>
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-[11px] font-semibold text-gray-700 mb-1">
-                    Year
-                  </label>
-                  <input
-                    type="text"
-                    value={year}
-                    onChange={(e) => setYear(e.target.value)}
-                    className="w-full bg-white border border-slate-200 text-gray-800 text-sm rounded-xl p-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-xs"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-gray-700 mb-1">
-                    Month
-                  </label>
-                  <input
-                    type="text"
-                    value={month}
-                    onChange={(e) => setMonth(e.target.value.toUpperCase())}
-                    className="w-full bg-white border border-slate-200 text-gray-800 text-sm rounded-xl p-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-xs"
-                    placeholder="AUG-26"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-gray-700 mb-1">
-                    Day Number
-                  </label>
-                  <input
-                    type="text"
-                    value={day}
-                    onChange={(e) => setDay(e.target.value)}
-                    className="w-full bg-white border border-slate-200 text-gray-800 text-sm rounded-xl p-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-xs"
-                    placeholder="22"
-                  />
-                </div>
+              <div>
+                <input
+                  id="snapshotDate"
+                  type="date"
+                  disabled={loading}
+                  value={snapshotDate}
+                  max={new Date().toISOString().slice(0, 10)}
+                  onChange={(e) => {
+                    setSnapshotDate(e.target.value);
+                    setPreviewData(null);
+                  }}
+                  className="w-full sm:w-60 bg-white border border-slate-200 text-gray-800 text-sm rounded-xl p-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+                <p className="text-[11px] text-gray-500 mt-2">
+                  Inventory sheets have no date columns, so this is the day the stock was
+                  counted. It becomes the snapshot&apos;s effective date.
+                </p>
               </div>
             </div>
           )}
@@ -296,16 +290,18 @@ export default function FileUpload({ isOpen, onClose }) {
             <input
               type="file"
               ref={fileInputRef}
-              accept=".xlsx, .xls"
+              accept=".xlsx,.xlsm,.xls,.csv"
+              disabled={loading}
               onChange={(e) => handleFileChange(e.target.files[0])}
               className="hidden"
             />
 
             <div
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
+              onDragOver={loading ? undefined : handleDragOver}
+              onDragLeave={loading ? undefined : handleDragLeave}
+              onDrop={loading ? (e) => e.preventDefault() : handleDrop}
+              onClick={loading ? undefined : () => fileInputRef.current?.click()}
+              aria-disabled={loading}
               className={`border-2 border-dashed rounded-[28px] p-8 text-center cursor-pointer transition bg-slate-50/50 flex flex-col items-center justify-center space-y-4 ${
                 isDragging
                   ? "border-blue-500 bg-blue-50/50"
@@ -419,24 +415,52 @@ export default function FileUpload({ isOpen, onClose }) {
 
             <div className="grid grid-cols-2 gap-3 text-sm bg-white p-3 rounded-xl border border-emerald-100 text-gray-700 shadow-xs">
               <p>
-                Total Rows:{" "}
-                <strong className="text-gray-900">{previewData.totalRows}</strong>
-              </p>
-              <p>
-                Months:{" "}
+                Rows:{" "}
                 <strong className="text-gray-900">
-                  {previewData.months.join(", ")}
+                  {previewData.usableRows.toLocaleString()} of{" "}
+                  {previewData.totalRows.toLocaleString()}
                 </strong>
               </p>
-              <p className="col-span-2">
-                Span:{" "}
+              <p>
+                Values:{" "}
                 <strong className="text-gray-900">
-                  {previewData.days.length} days
-                </strong>{" "}
-                (Day {previewData.days[0]} to{" "}
-                {previewData.days[previewData.days.length - 1]})
+                  {previewData.cells.toLocaleString()}
+                </strong>
+              </p>
+              <p>
+                Branches:{" "}
+                <strong className="text-gray-900">
+                  {previewData.branchColumns.length}
+                </strong>
+              </p>
+              <p>
+                {previewData.dates.length > 1 ? "Dates" : "Date"}:{" "}
+                <strong className="text-gray-900">
+                  {previewData.dates.length > 2
+                    ? `${previewData.dates[0]} → ${previewData.dates[previewData.dates.length - 1]}`
+                    : previewData.dates.join(", ") || "—"}
+                </strong>
+              </p>
+              <p className="col-span-2 text-xs text-gray-500">
+                {previewData.branchColumns.join(", ")}
               </p>
             </div>
+
+            {previewData.alreadyUploaded && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-sm text-amber-900">
+                This exact file was already uploaded on{" "}
+                {new Date(previewData.alreadyUploaded.at).toLocaleString()}. Uploading it
+                again will be rejected.
+              </div>
+            )}
+
+            {previewData.warnings?.length > 0 && (
+              <ul className="list-disc list-inside text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-3 space-y-1">
+                {previewData.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            )}
 
             <div className="flex space-x-3 pt-1">
               <button
@@ -447,6 +471,7 @@ export default function FileUpload({ isOpen, onClose }) {
                 {loading ? "Merging Data..." : "Confirm & Merge Upload"}
               </button>
               <button
+                disabled={loading}
                 onClick={() => setPreviewData(null)}
                 className="bg-white hover:bg-slate-100 text-gray-700 font-semibold px-4 py-2.5 rounded-xl transition border border-slate-200 shadow-xs cursor-pointer"
               >
@@ -456,14 +481,21 @@ export default function FileUpload({ isOpen, onClose }) {
           </div>
         )}
 
+        {errors.length > 0 && (
+          <div className="relative z-10 bg-red-50 border border-red-200 rounded-xl p-4 space-y-1.5">
+            <h3 className="text-sm font-bold text-red-900">
+              This file can&apos;t be uploaded
+            </h3>
+            <ul className="list-disc list-inside text-sm text-red-800 space-y-1">
+              {errors.map((e, i) => (
+                <li key={i}>{e}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {message && (
-          <div
-            className={`relative z-10 p-3 rounded-xl text-center text-sm font-semibold border ${
-              message.includes("Error")
-                ? "bg-red-50 text-red-700 border-red-200"
-                : "bg-blue-50 text-blue-700 border-blue-200"
-            }`}
-          >
+          <div className="relative z-10 p-3 rounded-xl text-center text-sm font-semibold border bg-blue-50 text-blue-700 border-blue-200">
             {message}
           </div>
         )}

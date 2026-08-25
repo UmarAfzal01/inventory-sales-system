@@ -72,6 +72,27 @@ export default function DashboardPage() {
 
   const [setupNeeded, setSetupNeeded] = useState(false);
 
+  // Date range. Empty means "all time", which is what the dashboard showed
+  // before — every figure was an all-time total with no way to narrow it.
+  const [fromDate, setFromDate] = useState(searchParams.get("from") || "");
+  const [toDate, setToDate] = useState(searchParams.get("to") || "");
+  // Stock is current state, not a time series, so a date range cannot apply to
+  // it. The API says whether a range is active so the cards can be labelled.
+  const [dateFiltered, setDateFiltered] = useState(false);
+  // Which snapshot the stock figures came from, and whether one exists at all
+  // for the selected end date.
+  const [stockDate, setStockDate] = useState(null);
+  const [stockAvailable, setStockAvailable] = useState(true);
+  const [dateBounds, setDateBounds] = useState({ minDate: null, maxDate: null });
+  // Bumped when an upload finishes, which re-runs the fetch below.
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    const onDataUpdated = () => setReloadKey((k) => k + 1);
+    window.addEventListener("inventory:data-updated", onDataUpdated);
+    return () => window.removeEventListener("inventory:data-updated", onDataUpdated);
+  }, []);
+
   // Close dropdowns on outside click
   useEffect(() => {
     const handleClickOutside = (e) => {
@@ -89,17 +110,19 @@ export default function DashboardPage() {
     const load = async () => {
       setLoading(true);
       try {
-        const queryParams = new URLSearchParams({
+        const qp = new URLSearchParams({
           branch: selectedBranch,
           type: selectedType,
           sellingStatus: selectedStatus,
-        }).toString();
+        });
+        if (fromDate) qp.set("from", fromDate);
+        if (toDate) qp.set("to", toDate);
 
-        const res = await fetch(`/api/dashboard?${queryParams}`, {
+        const res = await fetch(`/api/dashboard?${qp.toString()}`, {
           signal: controller.signal,
         }).then((r) => r.json());
-        
-        if (res.needsBackfill) {
+
+        if (res.needsUpload) {
           setSetupNeeded(true);
           return;
         }
@@ -109,6 +132,13 @@ export default function DashboardPage() {
         setStats(res.stats);
         setFilters(res.filtersList);
         setCategoriesData(res.categories);
+        setDateFiltered(Boolean(res.dateFiltered));
+        setStockDate(res.stockDate ?? null);
+        setStockAvailable(res.stockAvailable !== false);
+        setDateBounds({
+          minDate: res.filtersList?.minDate ?? null,
+          maxDate: res.filtersList?.maxDate ?? null,
+        });
       } catch (err) {
         if (err.name === "AbortError") return;
         console.error("Dashboard fetch error:", err);
@@ -122,7 +152,7 @@ export default function DashboardPage() {
 
     load();
     return () => controller.abort();
-  }, [selectedBranch, selectedType, selectedStatus]);
+  }, [selectedBranch, selectedType, selectedStatus, fromDate, toDate, reloadKey]);
 
   const formatNumber = (val) => {
     if (loading && !hasLoadedOnce) return "—";
@@ -330,6 +360,93 @@ export default function DashboardPage() {
               </div>
             )}
           </div>
+        </div>
+
+        {/* Date range. Sales are filtered by it; stock is current state and is
+            labelled as such, since stock cannot be summed over a period. */}
+        <div className="mb-8 bg-white/70 backdrop-blur-xl border border-slate-200 rounded-3xl p-5">
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label
+                htmlFor="fromDate"
+                className="block text-[11px] font-extrabold text-slate-500 uppercase tracking-wider mb-1.5"
+              >
+                From
+              </label>
+              <input
+                id="fromDate"
+                type="date"
+                value={fromDate}
+                max={toDate || undefined}
+                onChange={(e) => setFromDate(e.target.value)}
+                className="bg-white border border-slate-300 text-slate-800 text-sm rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div>
+              <label
+                htmlFor="toDate"
+                className="block text-[11px] font-extrabold text-slate-500 uppercase tracking-wider mb-1.5"
+              >
+                To
+              </label>
+              <input
+                id="toDate"
+                type="date"
+                value={toDate}
+                min={fromDate || undefined}
+                onChange={(e) => setToDate(e.target.value)}
+                className="bg-white border border-slate-300 text-slate-800 text-sm rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {[
+                { label: "Last 7 days", days: 7 },
+                { label: "Last 30 days", days: 30 },
+              ].map((p) => (
+                <button
+                  key={p.days}
+                  type="button"
+                  onClick={() => {
+                    const end = dateBounds.maxDate ? new Date(dateBounds.maxDate) : new Date();
+                    const start = new Date(end);
+                    start.setUTCDate(start.getUTCDate() - (p.days - 1));
+                    setFromDate(start.toISOString().slice(0, 10));
+                    setToDate(end.toISOString().slice(0, 10));
+                  }}
+                  className="px-3 py-2 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
+                >
+                  {p.label}
+                </button>
+              ))}
+              {(fromDate || toDate) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFromDate("");
+                    setToDate("");
+                  }}
+                  className="px-3 py-2 rounded-xl text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition"
+                >
+                  Clear dates ✕
+                </button>
+              )}
+            </div>
+
+          </div>
+
+          {dateFiltered && (
+            stockAvailable ? (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mt-3">
+                Sales reflect the selected dates. Stock as at {stockDate}.
+              </p>
+            ) : (
+              <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2 mt-3">
+                Sales reflect the selected dates. No stock count exists on or before{" "}
+                {toDate || "this date"}, so stock figures are not shown.
+              </p>
+            )
+          )}
         </div>
 
         {/* Sales & Stock Performance Section */}

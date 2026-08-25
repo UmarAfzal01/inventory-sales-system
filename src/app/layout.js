@@ -1,4 +1,5 @@
 "html" // standard metadata file wrapper
+import { Suspense } from "react";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import ClientLayoutWrapper from "@/components/ClientLayoutWrapper"; // or handled via a client wrapper component
@@ -25,8 +26,13 @@ export default function RootLayout({ children }) {
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="h-[100svh] overflow-hidden flex bg-gradient-to-br from-slate-100 via-blue-50/40 to-indigo-50/50 text-slate-800">
-        {/* We use a client wrapper component to manage the sidebar show/hide state */}
-        <ClientLayoutWrapper>{children}</ClientLayoutWrapper>
+        {/* We use a client wrapper component to manage the sidebar show/hide state.
+            It reads useSearchParams(), which opts the tree out of static
+            rendering, so it needs a Suspense boundary — without one the build
+            fails prerendering /_not-found. */}
+        <Suspense fallback={null}>
+          <ClientLayoutWrapper>{children}</ClientLayoutWrapper>
+        </Suspense>
       </body>
     </html>
   );
