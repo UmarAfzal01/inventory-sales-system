@@ -548,6 +548,61 @@ export async function rebuildMeta() {
   return doc;
 }
 
+/**
+ * Which category or sub-category rows a clicked metric card should leave
+ * visible. Returns a pass-everything predicate when no card is active.
+ *
+ * A null count means no stock snapshot covers the range — unknown, not zero —
+ * so the stock metrics match nothing rather than claiming every product
+ * qualifies.
+ */
+function rowMatchesMetric(metric) {
+  switch (metric) {
+    case "totalSales":
+      return (r) => r.totalSales !== 0;
+    case "positiveSales":
+      return (r) => r.positiveSales > 0;
+    case "negativeSales":
+      return (r) => r.negativeSales < 0;
+    case "negativeStock":
+      return (r) => (r.negativeStockCount ?? 0) > 0;
+    case "zeroStock":
+      return (r) => (r.zeroStockCount ?? 0) > 0;
+    default:
+      return () => true;
+  }
+}
+
+/**
+ * The same rule applied to a single product at level 3.
+ *
+ * `branchesCovered` is how many branches the snapshot reached, so "zero stock"
+ * means the same thing here as it does on the cards above: not stocked at every
+ * covered branch, rather than merely absent from one.
+ */
+function productMatchesMetric(metric, { branchesCovered, stockKnown, inCatalogue }) {
+  switch (metric) {
+    case "totalSales":
+      return (p) => p.sale !== 0;
+    case "positiveSales":
+      return (p) => p.pos > 0;
+    case "negativeSales":
+      return (p) => p.neg < 0;
+    case "negativeStock":
+      return (p) => stockKnown && Object.values(p.branchStock).some((q) => q < 0);
+    case "zeroStock":
+      // inCatalogue mirrors the headline count, which skips products that sold
+      // but no stock sheet covers. Without it the filtered list came back 537
+      // long while the card it was filtering by read 512.
+      return (p) =>
+        stockKnown &&
+        inCatalogue(p.barcode) &&
+        Object.keys(p.branchStock).length < branchesCovered;
+    default:
+      return () => true;
+  }
+}
+
 /** Every snapshot date held in stock_cube, oldest first. */
 export async function snapshotDates(database) {
   const dates = await database.collection(COL.STOCK_CUBE).distinct("date");
@@ -592,6 +647,7 @@ export async function readProducts({
   q = "",
   page = 1,
   pageSize = 50,
+  metricFilter = null,
 } = {}) {
   const database = db();
   // category / subCategory are optional. With neither, this is a global product
@@ -754,13 +810,23 @@ export async function readProducts({
   );
   function byIdName(bc) { return meta.get(bc)?.articleName; }
   const term = String(q || "").trim().toLowerCase();
-  const visible = term
+  const searched = term
     ? all.filter(
         (p) =>
           p.barcode.toLowerCase().includes(term) ||
           (meta.get(p.barcode)?.articleName || "").toLowerCase().includes(term)
       )
     : all;
+
+  // Applied before paging, so page 1 of a filtered list is full rather than
+  // whatever survived filtering the first fifty rows.
+  const visible = searched.filter(
+    productMatchesMetric(metricFilter, {
+      branchesCovered: branch === ALL ? (branchCount.length || BRANCH_CODES.length) : 1,
+      stockKnown: Boolean(stockDate),
+      inCatalogue: (barcode) => meta.has(barcode),
+    })
+  );
 
   const total = visible.length;
 
@@ -856,6 +922,7 @@ export async function readDashboard({
   from = null,
   to = null,
   category = null,
+  metricFilter = null,
 } = {}) {
   const database = db();
 
@@ -1086,11 +1153,15 @@ export async function readDashboard({
 
   // Tiebreak on name: many categories sit at zero sales, and without it their
   // card order changes between requests.
-  const categories = [...merged.values()].sort(
+  const allCategories = [...merged.values()].sort(
     (a, b) => b.totalSales - a.totalSales || a.categoryName.localeCompare(b.categoryName)
   );
+  // Filtered for display only. The headline figures below are deliberately
+  // computed over everything, so clicking "negative stock" narrows the list
+  // without changing the number on the card that was clicked.
+  const categories = allCategories.filter(rowMatchesMetric(metricFilter));
 
-  const stats = categories.reduce(
+  const stats = allCategories.reduce(
     (a, c) => ({
       totalProducts: a.totalProducts + c.productCount,
       totalInventory: a.totalInventory + (c.totalInventory ?? 0),

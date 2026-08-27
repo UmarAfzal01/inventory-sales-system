@@ -25,6 +25,10 @@ export async function GET(req) {
     //   category         -> sub-categories within it (reads the facts)
     //   category + sub   -> the products within that (reads the facts)
     const category = q.get("category") || null;
+    // A clicked metric card narrows the list at whichever level is showing.
+    // The headline figures stay computed over everything, so the card that was
+    // clicked keeps displaying its own total.
+    const metricFilter = q.get("metricFilter") || null;
     const subCategory = q.get("subCategory");
     const search = (q.get("q") || "").trim();
 
@@ -40,6 +44,7 @@ export async function GET(req) {
         category,
         subCategory,
         q: search,
+        metricFilter,
         page: Math.max(1, parseInt(q.get("page") || "1", 10) || 1),
         pageSize: Math.min(200, Math.max(1, parseInt(q.get("pageSize") || "50", 10) || 50)),
       });
@@ -53,6 +58,7 @@ export async function GET(req) {
       from: parseIsoDate(q.get("from")),
       to: parseIsoDate(q.get("to")),
       category,
+      metricFilter,
     });
 
     if (!data.ready) {
