@@ -436,12 +436,26 @@ export async function resolveStockDate(database, to) {
  * The resolved stock date is returned so the UI can state which snapshot the
  * stock figures came from rather than implying they match the sales range.
  */
+/**
+ * The dashboard read.
+ *
+ * The two dimensions answer a date range differently, because they mean
+ * different things:
+ *
+ *   Sales are events — summed across [from, to].
+ *   Stock is a position — resolved to a point: the most recent snapshot on or
+ *   before `to`. Summing stock over a period would be meaningless.
+ *
+ * The resolved stock date is returned so the UI can state which snapshot the
+ * stock figures came from rather than implying they match the sales range.
+ */
 export async function readDashboard({
   branch = ALL,
   type = ALL,
   sellingStatus = ALL,
   from = null,
   to = null,
+  category = null,
 } = {}) {
   const database = db();
 
@@ -449,6 +463,7 @@ export async function readDashboard({
   if (branch !== ALL) cubeMatch.branch = branch;
   if (type !== ALL) cubeMatch.type = type;
   if (sellingStatus !== ALL) cubeMatch.sellingStatus = sellingStatus;
+  if (category) cubeMatch.category = category;
   if (from || to) {
     cubeMatch.date = {};
     if (from) cubeMatch.date.$gte = from;
@@ -463,6 +478,10 @@ export async function readDashboard({
   const stockMatch = stockDate ? { date: stockDate, branch } : { _id: null };
   if (type !== ALL) stockMatch.type = type;
   if (sellingStatus !== ALL) stockMatch.sellingStatus = sellingStatus;
+  if (category) stockMatch.category = category;
+
+  // If a category drill-down is active, group by subCategory; otherwise group by top-level category
+  const groupField = category ? "$subCategory" : "$category";
 
   const [sales, stock, meta] = await Promise.all([
     database
@@ -471,7 +490,7 @@ export async function readDashboard({
         { $match: cubeMatch },
         {
           $group: {
-            _id: "$category",
+            _id: groupField,
             totalSales: { $sum: "$sale" },
             positiveSales: { $sum: "$pos" },
             negativeSales: { $sum: "$neg" },
@@ -485,7 +504,7 @@ export async function readDashboard({
         { $match: stockMatch },
         {
           $group: {
-            _id: "$category",
+            _id: groupField,
             productCount: { $sum: "$productCount" },
             totalInventory: { $sum: "$totalQty" },
             negativeStockCount: { $sum: "$negativeStockCount" },
@@ -499,15 +518,16 @@ export async function readDashboard({
 
   const merged = new Map();
   const slot = (name) => {
-    if (!merged.has(name)) {
-      merged.set(name, {
-        categoryName: name,
+    const keyName = name || UNCATEGORIZED;
+    if (!merged.has(keyName)) {
+      merged.set(keyName, {
+        categoryName: keyName,
         totalSales: 0, positiveSales: 0, negativeSales: 0,
         totalInventory: 0, productCount: 0,
         negativeStockCount: 0, zeroStockCount: 0,
       });
     }
-    return merged.get(name);
+    return merged.get(keyName);
   };
 
   for (const s of sales) Object.assign(slot(s._id), {

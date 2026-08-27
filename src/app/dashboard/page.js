@@ -11,6 +11,9 @@ export default function DashboardPage() {
   const urlType = searchParams.get("type");
   const urlStatus = searchParams.get("sellingStatus");
   const urlMetric = searchParams.get("metricFilter");
+  const urlFrom = searchParams.get("from");
+  const urlTo = searchParams.get("to");
+  const urlCategory = searchParams.get("category"); // Drill-down parent category parameter
 
   const [loading, setLoading] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
@@ -29,6 +32,9 @@ export default function DashboardPage() {
   const [selectedType, setSelectedType] = useState(urlType || "ALL");
   const [selectedStatus, setSelectedStatus] = useState(urlStatus || "ALL");
   const [activeMetricFilter, setActiveMetricFilter] = useState(urlMetric || null);
+  const [fromDate, setFromDate] = useState(urlFrom || "");
+  const [toDate, setToDate] = useState(urlTo || "");
+  const [selectedCategory, setSelectedCategory] = useState(urlCategory || null);
 
   // Category search state
   const [categorySearchQuery, setCategorySearchQuery] = useState("");
@@ -39,10 +45,13 @@ export default function DashboardPage() {
     setSelectedType(urlType || "ALL");
     setSelectedStatus(urlStatus || "ALL");
     setActiveMetricFilter(urlMetric || null);
-  }, [urlBranch, urlType, urlStatus, urlMetric]);
+    setFromDate(urlFrom || "");
+    setToDate(urlTo || "");
+    setSelectedCategory(urlCategory || null);
+  }, [urlBranch, urlType, urlStatus, urlMetric, urlFrom, urlTo, urlCategory]);
 
-  // Update URL parameters helper
-  const updateUrlParams = (newBranch, newType, newStatus, newMetric) => {
+  // Update URL parameters helper including category drill-down
+  const updateUrlParams = (newBranch, newType, newStatus, newMetric, newFrom, newTo, newCategory) => {
     const params = new URLSearchParams(searchParams.toString());
     
     if (newBranch && newBranch !== "ALL") params.set("branch", newBranch);
@@ -56,6 +65,15 @@ export default function DashboardPage() {
 
     if (newMetric) params.set("metricFilter", newMetric);
     else params.delete("metricFilter");
+
+    if (newFrom) params.set("from", newFrom);
+    else params.delete("from");
+
+    if (newTo) params.set("to", newTo);
+    else params.delete("to");
+
+    if (newCategory) params.set("category", newCategory);
+    else params.delete("category");
 
     router.replace(`${pathname}?${params.toString()}`, { scroll: false });
   };
@@ -72,19 +90,10 @@ export default function DashboardPage() {
 
   const [setupNeeded, setSetupNeeded] = useState(false);
 
-  // Date range. Empty means "all time", which is what the dashboard showed
-  // before — every figure was an all-time total with no way to narrow it.
-  const [fromDate, setFromDate] = useState(searchParams.get("from") || "");
-  const [toDate, setToDate] = useState(searchParams.get("to") || "");
-  // Stock is current state, not a time series, so a date range cannot apply to
-  // it. The API says whether a range is active so the cards can be labelled.
   const [dateFiltered, setDateFiltered] = useState(false);
-  // Which snapshot the stock figures came from, and whether one exists at all
-  // for the selected end date.
   const [stockDate, setStockDate] = useState(null);
   const [stockAvailable, setStockAvailable] = useState(true);
   const [dateBounds, setDateBounds] = useState({ minDate: null, maxDate: null });
-  // Bumped when an upload finishes, which re-runs the fetch below.
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
@@ -117,6 +126,7 @@ export default function DashboardPage() {
         });
         if (fromDate) qp.set("from", fromDate);
         if (toDate) qp.set("to", toDate);
+        if (selectedCategory) qp.set("category", selectedCategory); // Pass category parameter to API if drilled down
 
         const res = await fetch(`/api/dashboard?${qp.toString()}`, {
           signal: controller.signal,
@@ -152,7 +162,7 @@ export default function DashboardPage() {
 
     load();
     return () => controller.abort();
-  }, [selectedBranch, selectedType, selectedStatus, fromDate, toDate, reloadKey]);
+  }, [selectedBranch, selectedType, selectedStatus, fromDate, toDate, selectedCategory, reloadKey]);
 
   const formatNumber = (val) => {
     if (loading && !hasLoadedOnce) return "—";
@@ -162,7 +172,21 @@ export default function DashboardPage() {
   const handleMetricCardClick = (metricKey) => {
     const newMetric = activeMetricFilter === metricKey ? null : metricKey;
     setActiveMetricFilter(newMetric);
-    updateUrlParams(selectedBranch, selectedType, selectedStatus, newMetric);
+    updateUrlParams(selectedBranch, selectedType, selectedStatus, newMetric, fromDate, toDate, selectedCategory);
+  };
+
+  // Handle clicking a first level category card to drill down
+  const handleCategoryClick = (categoryName) => {
+    setSelectedCategory(categoryName);
+    setCategorySearchQuery(""); // reset search on category change
+    updateUrlParams(selectedBranch, selectedType, selectedStatus, activeMetricFilter, fromDate, toDate, categoryName);
+  };
+
+  // Handle going back from last level categories to first level view
+  const handleBackToFirstLevel = () => {
+    setSelectedCategory(null);
+    setCategorySearchQuery("");
+    updateUrlParams(selectedBranch, selectedType, selectedStatus, activeMetricFilter, fromDate, toDate, null);
   };
 
   // Filter categories based on the search query input
@@ -231,7 +255,7 @@ export default function DashboardPage() {
                   onClick={() => { 
                     setSelectedBranch("ALL"); 
                     setBranchOpen(false);
-                    updateUrlParams("ALL", selectedType, selectedStatus, activeMetricFilter);
+                    updateUrlParams("ALL", selectedType, selectedStatus, activeMetricFilter, fromDate, toDate, selectedCategory);
                   }}
                   className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
                     selectedBranch === "ALL" ? "bg-blue-600 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100"
@@ -246,7 +270,7 @@ export default function DashboardPage() {
                     onClick={() => { 
                       setSelectedBranch(b); 
                       setBranchOpen(false);
-                      updateUrlParams(b, selectedType, selectedStatus, activeMetricFilter);
+                      updateUrlParams(b, selectedType, selectedStatus, activeMetricFilter, fromDate, toDate, selectedCategory);
                     }}
                     className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all truncate ${
                       selectedBranch === b ? "bg-blue-600 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100"
@@ -282,7 +306,7 @@ export default function DashboardPage() {
                   onClick={() => { 
                     setSelectedType("ALL"); 
                     setTypeOpen(false);
-                    updateUrlParams(selectedBranch, "ALL", selectedStatus, activeMetricFilter);
+                    updateUrlParams(selectedBranch, "ALL", selectedStatus, activeMetricFilter, fromDate, toDate, selectedCategory);
                   }}
                   className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
                     selectedType === "ALL" ? "bg-blue-600 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100"
@@ -297,7 +321,7 @@ export default function DashboardPage() {
                     onClick={() => { 
                       setSelectedType(t); 
                       setTypeOpen(false);
-                      updateUrlParams(selectedBranch, t, selectedStatus, activeMetricFilter);
+                      updateUrlParams(selectedBranch, t, selectedStatus, activeMetricFilter, fromDate, toDate, selectedCategory);
                     }}
                     className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all truncate ${
                       selectedType === t ? "bg-blue-600 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100"
@@ -333,7 +357,7 @@ export default function DashboardPage() {
                   onClick={() => { 
                     setSelectedStatus("ALL"); 
                     setStatusOpen(false);
-                    updateUrlParams(selectedBranch, selectedType, "ALL", activeMetricFilter);
+                    updateUrlParams(selectedBranch, selectedType, "ALL", activeMetricFilter, fromDate, toDate, selectedCategory);
                   }}
                   className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
                     selectedStatus === "ALL" ? "bg-blue-600 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100"
@@ -348,7 +372,7 @@ export default function DashboardPage() {
                     onClick={() => { 
                       setSelectedStatus(s); 
                       setStatusOpen(false);
-                      updateUrlParams(selectedBranch, selectedType, s, activeMetricFilter);
+                      updateUrlParams(selectedBranch, selectedType, s, activeMetricFilter, fromDate, toDate, selectedCategory);
                     }}
                     className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all truncate ${
                       selectedStatus === s ? "bg-blue-600 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100"
@@ -362,8 +386,7 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Date range. Sales are filtered by it; stock is current state and is
-            labelled as such, since stock cannot be summed over a period. */}
+        {/* Date range section synced with URL search params */}
         <div className="mb-8 bg-white/70 backdrop-blur-xl border border-slate-200 rounded-3xl p-5">
           <div className="flex flex-wrap items-end gap-4">
             <div>
@@ -378,7 +401,11 @@ export default function DashboardPage() {
                 type="date"
                 value={fromDate}
                 max={toDate || undefined}
-                onChange={(e) => setFromDate(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setFromDate(val);
+                  updateUrlParams(selectedBranch, selectedType, selectedStatus, activeMetricFilter, val, toDate, selectedCategory);
+                }}
                 className="bg-white border border-slate-300 text-slate-800 text-sm rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
@@ -394,7 +421,11 @@ export default function DashboardPage() {
                 type="date"
                 value={toDate}
                 min={fromDate || undefined}
-                onChange={(e) => setToDate(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setToDate(val);
+                  updateUrlParams(selectedBranch, selectedType, selectedStatus, activeMetricFilter, fromDate, val, selectedCategory);
+                }}
                 className="bg-white border border-slate-300 text-slate-800 text-sm rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
@@ -411,8 +442,12 @@ export default function DashboardPage() {
                     const end = dateBounds.maxDate ? new Date(dateBounds.maxDate) : new Date();
                     const start = new Date(end);
                     start.setUTCDate(start.getUTCDate() - (p.days - 1));
-                    setFromDate(start.toISOString().slice(0, 10));
-                    setToDate(end.toISOString().slice(0, 10));
+                    const startStr = start.toISOString().slice(0, 10);
+                    const endStr = end.toISOString().slice(0, 10);
+
+                    setFromDate(startStr);
+                    setToDate(endStr);
+                    updateUrlParams(selectedBranch, selectedType, selectedStatus, activeMetricFilter, startStr, endStr, selectedCategory);
                   }}
                   className="px-3 py-2 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
                 >
@@ -425,6 +460,7 @@ export default function DashboardPage() {
                   onClick={() => {
                     setFromDate("");
                     setToDate("");
+                    updateUrlParams(selectedBranch, selectedType, selectedStatus, activeMetricFilter, "", "", selectedCategory);
                   }}
                   className="px-3 py-2 rounded-xl text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition"
                 >
@@ -548,12 +584,23 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* First Level Categories Cards Section */}
+        {/* Categories Breakdown Section (First Level or Last Level Drill-down) */}
         <div className="mb-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
-            <h2 className="text-xl font-extrabold tracking-tight text-slate-900 drop-shadow-sm">
-              First Level Categories Breakdown
-            </h2>
+            <div className="flex items-center gap-3">
+              {selectedCategory && (
+                <button
+                  type="button"
+                  onClick={handleBackToFirstLevel}
+                  className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-200 hover:bg-slate-300 text-slate-700 transition flex items-center gap-1.5 shadow-sm"
+                >
+                  ← Back to First Level
+                </button>
+              )}
+              <h2 className="text-xl font-extrabold tracking-tight text-slate-900 drop-shadow-sm">
+                {selectedCategory ? `Last Level Categories for "${selectedCategory}"` : "First Level Categories Breakdown"}
+              </h2>
+            </div>
 
             {/* Category Search Input Bar */}
             <div className="relative w-full sm:w-72">
@@ -594,14 +641,27 @@ export default function DashboardPage() {
               {filteredCategories.map((cat, idx) => (
                 <div 
                   key={idx} 
-                  className="bg-white/40 backdrop-blur-3xl p-6 rounded-3xl border border-white/60 shadow-[0_20px_50px_rgba(0,0,0,0.03)] hover:shadow-[0_20px_50px_rgba(0,0,0,0.06)] hover:border-white/80 transition-all flex flex-col justify-between"
+                  onClick={() => {
+                    // Only drill down if we are currently looking at first-level categories
+                    if (!selectedCategory) {
+                      handleCategoryClick(cat.categoryName);
+                    }
+                  }}
+                  className={`bg-white/40 backdrop-blur-3xl p-6 rounded-3xl border border-white/60 shadow-[0_20px_50px_rgba(0,0,0,0.03)] hover:shadow-[0_20px_50px_rgba(0,0,0,0.06)] hover:border-white/80 transition-all flex flex-col justify-between ${
+                    !selectedCategory ? "cursor-pointer group hover:bg-white/60" : ""
+                  }`}
                 >
                   <div>
                     {/* Category Title & Product Count Badge */}
                     <div className="flex items-start justify-between gap-2 mb-4">
-                      <h3 className="text-base font-extrabold text-slate-900 tracking-tight">
-                        {cat.categoryName}
-                      </h3>
+                      <div>
+                        <h3 className={`text-base font-extrabold text-slate-900 tracking-tight ${!selectedCategory ? "group-hover:text-blue-600 transition-colors" : ""}`}>
+                          {cat.categoryName}
+                        </h3>
+                        {!selectedCategory && (
+                          <span className="text-[10px] font-bold text-blue-500 uppercase tracking-wider">Click to view sub-categories →</span>
+                        )}
+                      </div>
                       <span className="px-3 py-1 rounded-full text-xs font-bold bg-white/70 text-slate-600 border border-white/90 shadow-sm shrink-0 backdrop-blur-md">
                         {cat.productCount.toLocaleString()} items
                       </span>

@@ -11,7 +11,7 @@ export const runtime = "nodejs";
  * The whole dashboard: headline stats, category breakdown, filter options.
  * Reads only the pre-aggregated cubes — never the fact tables.
  *
- * Params: branch, type, sellingStatus, from, to (yyyy-mm-dd, inclusive).
+ * Params: branch, type, sellingStatus, from, to, category (yyyy-mm-dd, inclusive).
  */
 export async function GET(req) {
   try {
@@ -25,6 +25,7 @@ export async function GET(req) {
       sellingStatus: q.get("sellingStatus") || "ALL",
       from: parseIsoDate(q.get("from")),
       to: parseIsoDate(q.get("to")),
+      category: q.get("category") || null, // Pass the category drill-down parameter here
     });
 
     if (!data.ready) {
