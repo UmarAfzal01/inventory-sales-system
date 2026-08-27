@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
 import { ensureSchema } from "@/lib/schema";
 import { parseIsoDate } from "@/lib/ingest";
-import { readDashboard } from "@/lib/warehouse";
+import { readDashboard, readProducts } from "@/lib/warehouse";
 
 export const runtime = "nodejs";
 
@@ -19,13 +19,40 @@ export async function GET(req) {
     await ensureSchema(mongoose.connection.db);
 
     const q = req.nextUrl.searchParams;
+
+    // Three drill-down levels, chosen by which parameters are present:
+    //   neither          -> first-level categories   (reads the cubes)
+    //   category         -> sub-categories within it (reads the facts)
+    //   category + sub   -> the products within that (reads the facts)
+    const category = q.get("category") || null;
+    const subCategory = q.get("subCategory");
+    const search = (q.get("q") || "").trim();
+
+    // A search term always yields products, whatever level the user is on —
+    // scoped to the category/sub-category if they have drilled in, global if not.
+    if (search || (category && subCategory !== null)) {
+      const level3 = await readProducts({
+        branch: q.get("branch") || "ALL",
+        type: q.get("type") || "ALL",
+        sellingStatus: q.get("sellingStatus") || "ALL",
+        from: parseIsoDate(q.get("from")),
+        to: parseIsoDate(q.get("to")),
+        category,
+        subCategory,
+        q: search,
+        page: Math.max(1, parseInt(q.get("page") || "1", 10) || 1),
+        pageSize: Math.min(200, Math.max(1, parseInt(q.get("pageSize") || "50", 10) || 50)),
+      });
+      return NextResponse.json({ success: true, level: "products", ...level3 });
+    }
+
     const data = await readDashboard({
       branch: q.get("branch") || "ALL",
       type: q.get("type") || "ALL",
       sellingStatus: q.get("sellingStatus") || "ALL",
       from: parseIsoDate(q.get("from")),
       to: parseIsoDate(q.get("to")),
-      category: q.get("category") || null, // Pass the category drill-down parameter here
+      category,
     });
 
     if (!data.ready) {
@@ -36,7 +63,11 @@ export async function GET(req) {
       });
     }
 
-    return NextResponse.json({ success: true, ...data });
+    return NextResponse.json({
+      success: true,
+      level: category ? "subCategories" : "categories",
+      ...data,
+    });
   } catch (error) {
     console.error("Dashboard error:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
