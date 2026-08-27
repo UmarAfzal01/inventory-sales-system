@@ -35,6 +35,22 @@ export default function DashboardPage() {
   const [fromDate, setFromDate] = useState(urlFrom || "");
   const [toDate, setToDate] = useState(urlTo || "");
   const [selectedCategory, setSelectedCategory] = useState(urlCategory || null);
+  // Level 3: the products inside one sub-category.
+  const [selectedSubCategory, setSelectedSubCategory] = useState(searchParams.get("subCategory"));
+  const [productData, setProductData] = useState(null);
+  const [productPage, setProductPage] = useState(1);
+  // Level 3 searches products server-side; level 1/2 filter their cards in the
+  // browser. Keeping the terms separate stops one clobbering the other.
+  const [productSearch, setProductSearch] = useState("");
+  const [productSearchDebounced, setProductSearchDebounced] = useState("");
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setProductSearchDebounced(productSearch);
+      setProductPage(1);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [productSearch]);
 
   // Category search state
   const [categorySearchQuery, setCategorySearchQuery] = useState("");
@@ -48,7 +64,8 @@ export default function DashboardPage() {
     setFromDate(urlFrom || "");
     setToDate(urlTo || "");
     setSelectedCategory(urlCategory || null);
-  }, [urlBranch, urlType, urlStatus, urlMetric, urlFrom, urlTo, urlCategory]);
+    setSelectedSubCategory(searchParams.get("subCategory"));
+  }, [urlBranch, urlType, urlStatus, urlMetric, urlFrom, urlTo, urlCategory, searchParams]);
 
   // Update URL parameters helper including category drill-down
   const updateUrlParams = (newBranch, newType, newStatus, newMetric, newFrom, newTo, newCategory) => {
@@ -126,7 +143,17 @@ export default function DashboardPage() {
         });
         if (fromDate) qp.set("from", fromDate);
         if (toDate) qp.set("to", toDate);
-        if (selectedCategory) qp.set("category", selectedCategory); // Pass category parameter to API if drilled down
+        if (selectedCategory) qp.set("category", selectedCategory);
+        if (selectedCategory && selectedSubCategory !== null) {
+          qp.set("subCategory", selectedSubCategory);
+        }
+        // A search term applies at every level — scoped to wherever the user has
+        // drilled to, global from the top. Sending it only at level 3 made the
+        // global search unreachable.
+        if (productSearchDebounced) qp.set("q", productSearchDebounced);
+        if (productSearchDebounced || selectedSubCategory !== null) {
+          qp.set("page", String(productPage));
+        }
 
         const res = await fetch(`/api/dashboard?${qp.toString()}`, {
           signal: controller.signal,
@@ -137,6 +164,19 @@ export default function DashboardPage() {
           return;
         }
         if (!res.success) throw new Error(res.error || "Dashboard request failed");
+
+        // Level 3 returns products rather than category cards.
+        if (res.level === "products") {
+          setProductData(res);
+          // Level 3 returns its own totals; without this the metric cards kept
+          // showing the level-2 figures while the list below had drilled deeper.
+          if (res.stats) setStats(res.stats);
+          setStockDate(res.stockDate ?? null);
+          setStockAvailable(Boolean(res.stockDate));
+          setSetupNeeded(false);
+          return;
+        }
+        setProductData(null);
 
         setSetupNeeded(false);
         setStats(res.stats);
@@ -162,11 +202,15 @@ export default function DashboardPage() {
 
     load();
     return () => controller.abort();
-  }, [selectedBranch, selectedType, selectedStatus, fromDate, toDate, selectedCategory, reloadKey]);
+  }, [selectedBranch, selectedType, selectedStatus, fromDate, toDate, selectedCategory, selectedSubCategory, productPage, productSearchDebounced, reloadKey]);
 
+  // null means "not known" — no stock snapshot covers the selected range — and
+  // must not render as 0, which reads as a counted zero. Only undefined, i.e. a
+  // field the response genuinely omitted, falls back to 0.
   const formatNumber = (val) => {
     if (loading && !hasLoadedOnce) return "—";
-    return val !== undefined && val !== null ? val.toLocaleString() : "0";
+    if (val === null) return "—";
+    return val !== undefined ? val.toLocaleString() : "0";
   };
 
   const handleMetricCardClick = (metricKey) => {
@@ -185,8 +229,41 @@ export default function DashboardPage() {
   // Handle going back from last level categories to first level view
   const handleBackToFirstLevel = () => {
     setSelectedCategory(null);
+    setSelectedSubCategory(null);
+    setProductData(null);
+    setProductPage(1);
     setCategorySearchQuery("");
-    updateUrlParams(selectedBranch, selectedType, selectedStatus, activeMetricFilter, fromDate, toDate, null);
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("category");
+    params.delete("subCategory");
+    params.delete("page");
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+  };
+
+  // Level 2 -> level 3: the products inside a sub-category.
+  const handleSubCategoryClick = (subName) => {
+    setSelectedSubCategory(subName);
+    setProductPage(1);
+    setProductSearch("");
+    setProductSearchDebounced("");
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("category", selectedCategory);
+    params.set("subCategory", subName);
+    params.delete("page");
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+  };
+
+  // Level 3 -> level 2.
+  const handleBackToSubCategories = () => {
+    setSelectedSubCategory(null);
+    setProductData(null);
+    setProductPage(1);
+    setProductSearch("");
+    setProductSearchDebounced("");
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("subCategory");
+    params.delete("page");
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
   };
 
   // Filter categories based on the search query input
@@ -214,23 +291,50 @@ export default function DashboardPage() {
               Real-time multi-branch inventory tracking, sales performance, and catalog overview.
             </p>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <span className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-bold bg-emerald-500/10 text-emerald-700 border border-emerald-500/20 shadow-sm backdrop-blur-md">
               <span className={`w-2 h-2 rounded-full ${loading ? "bg-amber-500" : "bg-emerald-500 animate-ping shadow-[0_0_8px_rgba(16,185,129,0.8)]"}`}></span>
               {loading ? "Updating Metrics..." : "Live Sync Active"}
             </span>
-            {setupNeeded && (
-              <span className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-bold bg-amber-500/10 text-amber-800 border border-amber-500/20 shadow-sm backdrop-blur-md">
-                <span className="w-2 h-2 rounded-full bg-amber-500"></span>
-                Summary data not built yet
-              </span>
-            )}
           </div>
         </div>
 
         {/* Filters Bar */}
         <div className="relative z-30 grid grid-cols-1 md:grid-cols-3 gap-5 bg-white/70 backdrop-blur-3xl p-6 rounded-3xl border border-white/80 shadow-[0_20px_50px_rgba(0,0,0,0.05)] mb-8">
           <div className="absolute -top-10 -right-10 w-32 h-32 bg-blue-400/10 rounded-full blur-2xl pointer-events-none"></div>
+
+          {/* Global product search. Works from any level: scoped to wherever
+              the user has drilled to, across the whole catalogue from the top.
+              Spans the full grid so it reads as the widest filter, above the
+              three that narrow it. */}
+          <div className="md:col-span-3">
+            <label className="block text-xs font-extrabold text-slate-400 uppercase tracking-wider mb-2">
+              Product Search
+            </label>
+            <div className="relative">
+              <span className="absolute inset-y-0 left-0 flex items-center pl-4 pointer-events-none text-slate-400">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+              </span>
+              <input
+                type="text"
+                value={productSearch}
+                onChange={(e) => setProductSearch(e.target.value)}
+                placeholder="Search any product by name or barcode..."
+                className="w-full pl-11 pr-10 py-3 bg-white/80 hover:bg-white border border-slate-200/80 rounded-2xl text-sm font-semibold text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all shadow-sm backdrop-blur-md"
+              />
+              {productSearch && (
+                <button
+                  type="button"
+                  onClick={() => setProductSearch("")}
+                  className="absolute inset-y-0 right-0 pr-4 flex items-center text-slate-400 hover:text-slate-600 text-xs font-bold"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          </div>
 
           {/* Branch Location Dropdown */}
           <div className="relative" ref={branchRef}>
@@ -591,19 +695,25 @@ export default function DashboardPage() {
               {selectedCategory && (
                 <button
                   type="button"
-                  onClick={handleBackToFirstLevel}
+                  onClick={productData ? handleBackToSubCategories : handleBackToFirstLevel}
                   className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-200 hover:bg-slate-300 text-slate-700 transition flex items-center gap-1.5 shadow-sm"
                 >
-                  ← Back to First Level
+                  {productData ? `← Back to ${selectedCategory}` : "← Back to First Level"}
                 </button>
               )}
               <h2 className="text-xl font-extrabold tracking-tight text-slate-900 drop-shadow-sm">
-                {selectedCategory ? `Last Level Categories for "${selectedCategory}"` : "First Level Categories Breakdown"}
+                {productData
+                  ? productSearch
+                    ? `Products matching "${productSearch}"${selectedCategory ? ` in ${selectedSubCategory || selectedCategory}` : ""}`
+                    : `Products in "${selectedSubCategory || "—"}"`
+                  : selectedCategory
+                    ? `Last Level Categories for "${selectedCategory}"`
+                    : "First Level Categories Breakdown"}
               </h2>
             </div>
 
-            {/* Category Search Input Bar */}
-            <div className="relative w-full sm:w-72">
+            {/* Card name filter — only meaningful when cards are on screen */}
+            <div className={`relative w-full sm:w-72 ${productData ? "hidden" : ""}`}>
               <span className="absolute inset-y-0 left-0 flex items-center pl-3.5 pointer-events-none text-slate-400">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -613,7 +723,7 @@ export default function DashboardPage() {
                 type="text"
                 value={categorySearchQuery}
                 onChange={(e) => setCategorySearchQuery(e.target.value)}
-                placeholder="Search category name..."
+                placeholder="Filter by category..."
                 className="w-full pl-10 pr-9 py-2.5 bg-white/70 backdrop-blur-xl border border-slate-200/80 rounded-2xl text-xs font-semibold text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all shadow-sm"
               />
               {categorySearchQuery && (
@@ -628,7 +738,133 @@ export default function DashboardPage() {
             </div>
           </div>
           
-          {loading && !hasLoadedOnce ? (
+          {productData ? (
+            <div className="bg-white/60 backdrop-blur-3xl rounded-3xl border border-white/60 shadow-[0_20px_50px_rgba(0,0,0,0.03)] overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 border-b border-slate-200/70">
+                <p className="text-sm font-bold text-slate-700">
+                  {productData.total.toLocaleString()} products
+                  {productData.stockDate && (
+                    <span className="font-medium text-slate-500">
+                      {" "}· stock as at {productData.stockDate}
+                    </span>
+                  )}
+                </p>
+                {productData.total > productData.pageSize && (
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={productData.page <= 1}
+                      onClick={() => setProductPage((p) => Math.max(1, p - 1))}
+                      className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      Previous
+                    </button>
+                    <span className="text-xs font-semibold text-slate-500 tabular-nums">
+                      {productData.page} / {Math.ceil(productData.total / productData.pageSize)}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={productData.page >= Math.ceil(productData.total / productData.pageSize)}
+                      onClick={() => setProductPage((p) => p + 1)}
+                      className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      Next
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {productData.products.length === 0 ? (
+                <div className="px-6 py-12 text-center text-slate-400 font-semibold">
+                  No products match the selected filters.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4 p-4">
+                  {productData.products.map((p, i) => {
+                    const rank = (productData.page - 1) * productData.pageSize + i + 1;
+                    return (
+                      <div
+                        key={p.barcode}
+                        className="bg-white rounded-2xl border border-slate-200/80 p-4 shadow-[0_6px_20px_rgba(0,0,0,0.04)] hover:shadow-[0_10px_28px_rgba(0,0,0,0.07)] transition"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <span className="px-2.5 py-1 rounded-lg bg-blue-50 border border-blue-100 text-[11px] font-extrabold text-blue-700 font-mono">
+                            SKU: {p.barcode}
+                          </span>
+                          <span className="text-[11px] font-bold text-slate-300">#{rank}</span>
+                        </div>
+
+                        <h3 className="mt-2.5 text-sm font-extrabold text-slate-900 leading-snug">
+                          {p.articleName}
+                        </h3>
+
+                        <div className="mt-3 flex flex-wrap items-center gap-2">
+                          {p.type && (
+                            <span className="px-2 py-0.5 rounded-md bg-slate-100 text-[10px] font-bold text-slate-600">
+                              {p.type}
+                            </span>
+                          )}
+                          {p.sellingStatus && (
+                            <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-[10px] font-bold text-emerald-700">
+                              {p.sellingStatus}
+                            </span>
+                          )}
+                          <span className="ml-auto text-xs font-extrabold text-slate-900 tabular-nums">
+                            {Math.round(p.sale).toLocaleString()}
+                            <span className="text-[10px] font-bold text-slate-400"> units</span>
+                            <span className="text-slate-300"> · </span>
+                            {Math.round(p.stock).toLocaleString()}
+                            <span className="text-[10px] font-bold text-slate-400"> stock</span>
+                          </span>
+                        </div>
+
+                        <div className="mt-3 pt-3 border-t border-slate-100">
+                          <div className="flex items-center justify-between text-[10px] font-extrabold uppercase tracking-wider text-slate-400 mb-1">
+                            <span>By branch</span>
+                            <span>
+                              <span className="text-indigo-500">units sold</span>
+                              <span className="text-slate-300"> · </span>
+                              <span className="text-blue-500">stock</span>
+                            </span>
+                          </div>
+                          {/* One branch per line. Cards are three-across on wide
+                              screens, so the row stays narrow and the name sits
+                              close to its figures. */}
+                          <div className="grid grid-cols-1">
+                            {(productData.branches ?? []).map((b) => {
+                              const qty = p.branchStock?.[b] ?? 0;
+                              const sold = p.branchSales?.[b] ?? 0;
+                              const idle = qty === 0 && sold === 0;
+                              return (
+                                <div
+                                  key={b}
+                                  className={`flex items-baseline justify-between gap-2 py-1 border-b border-slate-50 text-xs ${
+                                    idle ? "opacity-35" : ""
+                                  }`}
+                                >
+                                  <span className="font-bold text-slate-500 w-12 shrink-0">{b}</span>
+                                  <span className="flex-1 flex items-baseline justify-end gap-3 tabular-nums">
+                                    <span className={`font-bold ${sold ? "text-indigo-700" : "text-slate-400"}`}>
+                                      {Math.round(sold).toLocaleString()}
+                                    </span>
+                                    <span className={`font-bold w-16 text-right ${
+                                      qty < 0 ? "text-rose-600" : qty === 0 ? "text-slate-400" : "text-slate-800"
+                                    }`}>
+                                      {Math.round(qty).toLocaleString()}
+                                    </span>
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          ) : loading && !hasLoadedOnce ? (
             <div className="bg-white/40 backdrop-blur-3xl p-10 rounded-3xl border border-white/60 text-center text-slate-400 font-semibold shadow-[0_20px_50px_rgba(0,0,0,0.03)]">
               Loading category analytics cards...
             </div>
@@ -642,25 +878,24 @@ export default function DashboardPage() {
                 <div 
                   key={idx} 
                   onClick={() => {
-                    // Only drill down if we are currently looking at first-level categories
-                    if (!selectedCategory) {
-                      handleCategoryClick(cat.categoryName);
-                    }
+                    if (!selectedCategory) handleCategoryClick(cat.categoryName);
+                    else handleSubCategoryClick(cat.categoryName);
                   }}
                   className={`bg-white/40 backdrop-blur-3xl p-6 rounded-3xl border border-white/60 shadow-[0_20px_50px_rgba(0,0,0,0.03)] hover:shadow-[0_20px_50px_rgba(0,0,0,0.06)] hover:border-white/80 transition-all flex flex-col justify-between ${
-                    !selectedCategory ? "cursor-pointer group hover:bg-white/60" : ""
+                    "cursor-pointer group hover:bg-white/60"
                   }`}
                 >
                   <div>
                     {/* Category Title & Product Count Badge */}
                     <div className="flex items-start justify-between gap-2 mb-4">
                       <div>
-                        <h3 className={`text-base font-extrabold text-slate-900 tracking-tight ${!selectedCategory ? "group-hover:text-blue-600 transition-colors" : ""}`}>
+                        <h3 className="text-base font-extrabold text-slate-900 tracking-tight group-hover:text-blue-600 transition-colors">
                           {cat.categoryName}
                         </h3>
-                        {!selectedCategory && (
-                          <span className="text-[10px] font-bold text-blue-500 uppercase tracking-wider">Click to view sub-categories →</span>
-                        )}
+                        {/* Both levels are drillable, so both say so. */}
+                        <span className="text-[10px] font-bold text-blue-500 uppercase tracking-wider">
+                          {selectedCategory ? "Click to view products →" : "Click to view sub-categories →"}
+                        </span>
                       </div>
                       <span className="px-3 py-1 rounded-full text-xs font-bold bg-white/70 text-slate-600 border border-white/90 shadow-sm shrink-0 backdrop-blur-md">
                         {cat.productCount.toLocaleString()} items
@@ -706,7 +941,7 @@ export default function DashboardPage() {
                             <span className="w-2.5 h-2.5 rounded-full bg-red-600 shadow-[0_0_8px_rgba(220,38,38,0.7)]"></span>
                             Negative Stock
                           </span>
-                          <span className="font-black text-red-950 text-sm">{cat.negativeStockCount.toLocaleString()}</span>
+                          <span className="font-black text-red-950 text-sm">{formatNumber(cat.negativeStockCount)}</span>
                         </div>
                       )}
 
@@ -716,7 +951,7 @@ export default function DashboardPage() {
                             <span className="w-2.5 h-2.5 rounded-full bg-amber-600 shadow-[0_0_8px_rgba(217,119,6,0.7)]"></span>
                             Zero Stock
                           </span>
-                          <span className="font-black text-amber-950 text-sm">{cat.zeroStockCount.toLocaleString()}</span>
+                          <span className="font-black text-amber-950 text-sm">{formatNumber(cat.zeroStockCount)}</span>
                         </div>
                       )}
 

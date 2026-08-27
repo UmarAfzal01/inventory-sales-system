@@ -1,11 +1,17 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import * as XLSX from "xlsx";
+import { Readable } from "stream";
 import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
 import { COL, ensureSchema } from "@/lib/schema";
 import { validateFile, validateHeaders, parseRow, parseIsoDate, normHeader, dateSlug } from "@/lib/ingest";
-import { commit, rebuildMeta } from "@/lib/warehouse";
+import { commit, rebuildMeta, compactIndexes } from "@/lib/warehouse";
+
+// SheetJS's streaming reader needs Node's Readable handed to it explicitly.
+// Under Next's bundler it is not auto-detected, and to_json fails with
+// "_Readable is not a function".
+XLSX.stream.set_readable(Readable);
 
 export const runtime = "nodejs";
 // Parsing a 23MB sheet, writing the facts and rebuilding the cubes all happen
@@ -16,7 +22,10 @@ export async function POST(req) {
   try {
     await dbConnect();
     const database = mongoose.connection.db;
-    await ensureSchema(database);
+    // Forced here, unlike on the read path: an upload is rare and slow enough
+    // that re-checking is free, and it is the one moment worth paying to
+    // rebuild indexes dropped by hand or lost when the cluster was cleared.
+    await ensureSchema(database, { force: true });
 
     const form = await req.formData();
     const file = form.get("file");
@@ -81,12 +90,15 @@ export async function POST(req) {
     // format. Formatted reads render long barcodes as "6.33152E+11", which
     // corrupts them and can merge two products onto one id. Text-typed cells
     // (the ones with leading zeros) are unaffected either way.
-    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: true });
-    if (!rawRows.length) {
+    //
+    // Headers come from a one-row read so the whole sheet is not materialised
+    // just to validate them.
+    const headerRow = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: true, range: 0 })[0];
+    if (!headerRow) {
       return NextResponse.json({ success: false, error: "The sheet has no rows." }, { status: 400 });
     }
 
-    const headerCheck = validateHeaders(Object.keys(rawRows[0]), fileType);
+    const headerCheck = validateHeaders(Object.keys(headerRow), fileType);
     if (!headerCheck.ok) {
       return NextResponse.json(
         { success: false, stage: "headers", errors: headerCheck.errors, warnings: headerCheck.warnings },
@@ -97,22 +109,39 @@ export async function POST(req) {
     const rows = [];
     const skipped = { noBarcode: 0, noDate: 0, badBarcode: 0 };
     const dateSet = new Map();
+    let totalRows = 0;
 
-    for (const raw of rawRows) {
-      const row = {};
-      for (const k of Object.keys(raw)) row[normHeader(k)] = raw[k];
+    // Streamed rather than read into an array first.
+    //
+    // A 493k-row sales sheet previously held three copies at once — the parsed
+    // workbook, the full sheet_to_json array, and the parsed `rows` — and
+    // exhausted Node's heap. Streaming drops one of those, and each raw row is
+    // discarded as soon as it has been parsed.
+    await new Promise((resolve, reject) => {
+      const stream = XLSX.stream.to_json(sheet, { defval: "", raw: true });
+      stream.on("data", (raw) => {
+        totalRows++;
+        const row = {};
+        for (const k of Object.keys(raw)) row[normHeader(k)] = raw[k];
 
-      const parsed = parseRow(row, {
-        fileType,
-        branchColumns: headerCheck.branchColumns,
-        snapshotDate,
+        const parsed = parseRow(row, {
+          fileType,
+          branchColumns: headerCheck.branchColumns,
+          snapshotDate,
+        });
+        if (parsed.skip === "no-barcode") { skipped.noBarcode++; return; }
+        if (parsed.skip === "bad-barcode") { skipped.badBarcode++; return; }
+        if (parsed.skip === "no-date") { skipped.noDate++; return; }
+
+        dateSet.set(parsed.date.getTime(), parsed.date);
+        rows.push(parsed);
       });
-      if (parsed.skip === "no-barcode") { skipped.noBarcode++; continue; }
-      if (parsed.skip === "bad-barcode") { skipped.badBarcode++; continue; }
-      if (parsed.skip === "no-date") { skipped.noDate++; continue; }
+      stream.on("error", reject);
+      stream.on("end", resolve);
+    });
 
-      dateSet.set(parsed.date.getTime(), parsed.date);
-      rows.push(parsed);
+    if (!totalRows) {
+      return NextResponse.json({ success: false, error: "The sheet has no rows." }, { status: 400 });
     }
 
     const dates = [...dateSet.values()].sort((a, b) => a - b);
@@ -128,7 +157,7 @@ export async function POST(req) {
 
     const summary = {
       fileType,
-      totalRows: rawRows.length,
+      totalRows,
       usableRows: rows.length,
       branchColumns: headerCheck.branchColumns,
       dates: dates.map(dateSlug),
@@ -173,15 +202,20 @@ export async function POST(req) {
       );
     }
 
+    // Claiming the running slot IS the lock — a partial unique index permits
+    // only one batch with status "running", so a second concurrent upload fails
+    // on insert rather than racing past a check.
+    const STALE_AFTER_MS = 30 * 60 * 1000;
     const batchId = new mongoose.Types.ObjectId();
-    await database.collection(COL.BATCHES).insertOne({
+    const claim = async () =>
+      database.collection(COL.BATCHES).insertOne({
       _id: batchId,
       fileHash,
       fileName: file.name ?? "upload.xlsx",
       fileSize: buffer.length,
       fileType,
       dates,
-      totalRows: rawRows.length,
+      totalRows,
       usableRows: rows.length,
       skipped,
       warnings,
@@ -190,11 +224,46 @@ export async function POST(req) {
     });
 
     try {
+      await claim();
+    } catch (err) {
+      if (err.code !== 11000) throw err;
+      // Someone holds the slot. Release it only if it is clearly abandoned;
+      // otherwise tell the caller to wait.
+      const holder = await database.collection(COL.BATCHES).findOne({ status: "running" });
+      const age = holder ? Date.now() - holder.uploadedAt.getTime() : Infinity;
+      if (holder && age < STALE_AFTER_MS) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              `Another upload is still running (${holder.fileName}, started ` +
+              `${Math.max(1, Math.round(age / 60000))} minute(s) ago). Wait for it to finish.`,
+          },
+          { status: 409 }
+        );
+      }
+      if (holder) {
+        await database
+          .collection(COL.BATCHES)
+          .updateOne({ _id: holder._id }, { $set: { status: "abandoned" } });
+      }
+      await claim();
+    }
+
+    try {
       const result = await commit({ rows, fileType, batchId, dates });
       await rebuildMeta();
+
+      // commit() drops the secondary indexes on the collections it bulk-loads
+      // and rebuilds them at the end, so those come back compact on their own.
+      // `products` is upserted outside that window, so it still bloats slowly.
+      const reclaimed = await compactIndexes(database, [COL.PRODUCTS]);
       await database
         .collection(COL.BATCHES)
-        .updateOne({ _id: batchId }, { $set: { status: "committed", ...result } });
+        .updateOne(
+          { _id: batchId },
+          { $set: { status: "committed", indexBytesReclaimed: reclaimed, ...result } }
+        );
 
       // A back-dated inventory sheet is recorded as history but deliberately
       // does not become the current stock position. Say so plainly rather than

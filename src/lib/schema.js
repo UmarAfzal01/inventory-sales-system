@@ -82,10 +82,33 @@ export const JUNK_VALUES = new Set(["#N/A", "#REF!", "#VALUE!", "#NAME?", "#DIV/
 
 export const UNCATEGORIZED = "UNCATEGORIZED";
 
+// Resolved once the schema has been applied in this process. Every dashboard
+// request used to re-run the whole thing — a listCollections, nine collMods and
+// twenty-three createIndex commands before a single row was read, which on a
+// throttled cluster is a visible chunk of page-load time. It also quietly
+// undoes any index dropped by hand to reclaim space.
+let schemaReady = null;
+
 /**
  * Creates collections with validators and indexes. Idempotent — safe to re-run.
+ *
+ * Runs its real work once per process; later calls await the same promise. Pass
+ * `{ force: true }` to re-apply after dropping a collection or an index.
  */
-export async function ensureSchema(db) {
+export async function ensureSchema(db, { force = false } = {}) {
+  if (force) schemaReady = null;
+  if (!schemaReady) {
+    // Cache the promise, not the result, so concurrent callers share one run —
+    // and clear it on failure so the next call retries rather than assuming.
+    schemaReady = applySchema(db).catch((err) => {
+      schemaReady = null;
+      throw err;
+    });
+  }
+  return schemaReady;
+}
+
+async function applySchema(db) {
   const existing = new Set((await db.listCollections().toArray()).map((c) => c.name));
   const create = async (name, validator) => {
     if (existing.has(name)) {
@@ -189,6 +212,15 @@ export async function ensureSchema(db) {
    */
   await Promise.all([
     index(COL.SALES_FACTS, { date: 1, branch: 1 }),
+    // Drill-down reads facts directly: cubes aggregate the product away, so
+    // product-level listing is impossible from them. These serve level 2
+    // (sub-category) and level 3 (products within one).
+    index(COL.SALES_FACTS, { category: 1, subCategory: 1, date: 1 }),
+    index(COL.SALES_FACTS, { barcode: 1, date: 1 }),
+    index(COL.INVENTORY_STATE, { category: 1, subCategory: 1 }),
+    // Level 3 seeds its list from the catalogue so out-of-stock, non-selling
+    // products still appear; this keeps that a seek rather than a 194k scan.
+    index(COL.PRODUCTS, { category: 1, subCategory: 1 }),
     // `barcode` serves the $lookup in rebuildStockCube and is needed.
     //
     // There was a { branch, qty } index here too. On 500k documents it cost
@@ -203,6 +235,8 @@ export async function ensureSchema(db) {
     // Stock cubes are per snapshot date; `date` leads because every read first
     // resolves which snapshot to use, then filters within it.
     index(COL.STOCK_CUBE, { date: 1, branch: 1, type: 1, sellingStatus: 1 }),
+    index(COL.STOCK_CUBE, { date: 1, branch: 1, category: 1 }),
+    index(COL.DAILY_CUBE, { branch: 1, category: 1, date: 1 }),
     index(COL.COVERAGE, { date: 1, branch: 1 }),
     // A file may only be ingested once — but only a COMMITTED batch reserves its
     // hash. A plain unique index would let a failed upload block its own retry
@@ -211,6 +245,16 @@ export async function ensureSchema(db) {
       COL.BATCHES,
       { fileHash: 1 },
       { name: "fileHash_committed", unique: true, partialFilterExpression: { status: "committed" } }
+    ),
+    // At most one upload may be running at a time, enforced by the database
+    // rather than by a check in the route. Checking first and inserting after is
+    // a race: two simultaneous uploads both find nothing and both proceed, which
+    // is exactly what happened — they doubled peak memory and rebuilt cubes from
+    // facts the other was still writing.
+    index(
+      COL.BATCHES,
+      { status: 1 },
+      { name: "one_running_at_a_time", unique: true, partialFilterExpression: { status: "running" } }
     ),
   ]);
 

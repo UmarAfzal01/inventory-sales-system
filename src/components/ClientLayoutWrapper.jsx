@@ -13,6 +13,18 @@ export default function ClientLayoutWrapper({ children }) {
   const searchParams = useSearchParams();
   const currentBranch = searchParams.get("branch");
 
+  // Changing branch must keep every other parameter — category, sub-category,
+  // dates, type, status. Linking to a bare /dashboard?branch=X threw the user
+  // back to the top level and silently dropped their filters.
+  const branchHref = (name) => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (name) params.set("branch", name);
+    else params.delete("branch");
+    params.delete("page"); // a different branch means a different result set
+    const qs = params.toString();
+    return qs ? `/dashboard?${qs}` : "/dashboard";
+  };
+
   const [branchesData, setBranchesData] = useState([]);
   const [loadingBranches, setLoadingBranches] = useState(true);
 
@@ -123,7 +135,7 @@ export default function ClientLayoutWrapper({ children }) {
                 </div>
                 <div className="space-y-2 px-1">
                   <Link 
-                    href="/dashboard"
+                    href={branchHref(null)}
                     className={`px-3.5 py-2.5 backdrop-blur-xl rounded-2xl border transition duration-200 flex items-center justify-between ${
                       !currentBranch 
                         ? "bg-blue-600/10 border-blue-500/30 text-blue-700 shadow-sm" 
@@ -148,7 +160,7 @@ export default function ClientLayoutWrapper({ children }) {
                       return (
                         <Link 
                           key={idx} 
-                          href={`/dashboard?branch=${encodeURIComponent(branch.name)}`}
+                          href={branchHref(branch.name)}
                           className={`px-3.5 py-2.5 backdrop-blur-xl rounded-2xl border transition duration-200 flex items-center justify-between ${
                             isSelected 
                               ? "bg-blue-600/10 border-blue-500/30 shadow-sm ring-1 ring-blue-500/30" 
