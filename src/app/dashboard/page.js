@@ -2,6 +2,17 @@
 import { useState, useEffect, useRef } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 
+// Names the branch grid after whatever metric card is active, so a card
+// showing two of eleven branches says why.
+const BRANCH_HEADING = {
+  totalSales: "Branches with sales",
+  positiveSales: "Branches with positive sales",
+  negativeSales: "Branches with negative sales",
+  negativeStock: "Branches with negative stock",
+  zeroStock: "Branches with zero stock",
+  zeroSales: "Branches in stock, nothing sold",
+};
+
 export default function DashboardPage() {
   const router = useRouter();
   const pathname = usePathname();
@@ -258,7 +269,54 @@ export default function DashboardPage() {
   const formatNumber = (val) => {
     if (loading && !hasLoadedOnce) return "—";
     if (val === null) return "—";
-    return val !== undefined ? val.toLocaleString() : "0";
+    if (val === undefined) return "0";
+    // Quantities can be fractional (weighed goods), but two decimals on a
+    // seven-figure total is noise that also costs three characters of width.
+    // Precision is kept where it can still be read.
+    return val.toLocaleString(undefined, {
+      maximumFractionDigits: Math.abs(val) >= 1000 ? 0 : 2,
+    });
+  };
+
+  // Which branches a product card should list.
+  //
+  // With a metric card active, showing all eleven buries the answer: filtering
+  // by zero stock and then having to scan the row for the two branches that
+  // actually read zero defeats the filter. These mirror the server-side
+  // predicates so a card never disagrees with the list it came from.
+  //
+  // A branch missing from branchStock has no non-zero reading, which is zero —
+  // inventory_state stores only non-zero rows.
+  const branchesForMetric = (p) => {
+    const all = productData?.branches ?? [];
+    const stock = (b) => p.branchStock?.[b] ?? 0;
+    const sold = (b) => p.branchSales?.[b] ?? 0;
+    switch (activeMetricFilter) {
+      case "totalSales":
+        return all.filter((b) => sold(b) !== 0);
+      case "positiveSales":
+        return all.filter((b) => sold(b) > 0);
+      case "negativeSales":
+        return all.filter((b) => sold(b) < 0);
+      case "negativeStock":
+        return all.filter((b) => stock(b) < 0);
+      case "zeroStock":
+        return all.filter((b) => stock(b) === 0);
+      case "zeroSales":
+        // Dead stock is per branch too: something on that shelf, nothing sold.
+        return all.filter((b) => stock(b) > 0 && sold(b) === 0);
+      default:
+        return all;
+    }
+  };
+
+  // Metric values run from "—" to "6,708,079.15". At a fixed 2xl the long ones
+  // overflowed their card, so the size steps down as the string grows.
+  const metricValueClass = (val) => {
+    const len = formatNumber(val).length;
+    if (len > 11) return "text-base";
+    if (len > 8) return "text-xl";
+    return "text-2xl";
   };
 
   const handleMetricCardClick = (metricKey) => {
@@ -742,16 +800,24 @@ export default function DashboardPage() {
               {[
                 { label: "Last 7 days", days: 7 },
                 { label: "Last 30 days", days: 30 },
+                // Calendar months, not 30-day multiples: "2 months" should land
+                // on the same day-of-month, which setUTCMonth handles including
+                // the short-month rollover.
+                { label: "Last 2 months", months: 2 },
+                { label: "Last 3 months", months: 3 },
+                { label: "Last 6 months", months: 6 },
+                { label: "Last 1 year", months: 12 },
               ].map((p) => (
                 <button
-                  key={p.days}
+                  key={p.label}
                   type="button"
                   onClick={() => {
                     const end = dateBounds.maxDate
                       ? new Date(dateBounds.maxDate)
                       : new Date();
                     const start = new Date(end);
-                    start.setUTCDate(start.getUTCDate() - (p.days - 1));
+                    if (p.months) start.setUTCMonth(start.getUTCMonth() - p.months);
+                    else start.setUTCDate(start.getUTCDate() - (p.days - 1));
                     const startStr = start.toISOString().slice(0, 10);
                     const endStr = end.toISOString().slice(0, 10);
 
@@ -825,7 +891,7 @@ export default function DashboardPage() {
             )}
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
             {/* Net Sales Card */}
             <div
               onClick={() => handleMetricCardClick("totalSales")}
@@ -841,7 +907,7 @@ export default function DashboardPage() {
                 Total Sales (Net)
               </h3>
               <p
-                className={`text-2xl font-black mt-2 ${activeMetricFilter === "totalSales" ? "text-white" : "text-slate-900"}`}
+                className={`${metricValueClass(stats.totalSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "totalSales" ? "text-white" : "text-slate-900"}`}
               >
                 {formatNumber(stats.totalSales)}
               </p>
@@ -867,7 +933,7 @@ export default function DashboardPage() {
                 Positive Sales
               </h3>
               <p
-                className={`text-2xl font-black mt-2 ${activeMetricFilter === "positiveSales" ? "text-white" : "text-teal-700"}`}
+                className={`${metricValueClass(stats.positiveSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "positiveSales" ? "text-white" : "text-teal-700"}`}
               >
                 {formatNumber(stats.positiveSales)}
               </p>
@@ -893,12 +959,38 @@ export default function DashboardPage() {
                 Negative Sales
               </h3>
               <p
-                className={`text-2xl font-black mt-2 ${activeMetricFilter === "negativeSales" ? "text-white" : "text-rose-700"}`}
+                className={`${metricValueClass(stats.negativeSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "negativeSales" ? "text-white" : "text-rose-700"}`}
               >
                 {formatNumber(stats.negativeSales)}
               </p>
               <div
                 className={`mt-2 text-[11px] font-semibold ${activeMetricFilter === "negativeSales" ? "text-rose-200" : "text-rose-600"}`}
+              >
+                Click to filter categories
+              </div>
+            </div>
+
+            {/* Zero Sales Card - dead stock: on the shelf, moving nothing. */}
+            <div
+              onClick={() => handleMetricCardClick("zeroSales")}
+              className={`cursor-pointer backdrop-blur-3xl p-5 rounded-3xl border transition-all ${
+                activeMetricFilter === "zeroSales"
+                  ? "bg-violet-600 text-white shadow-lg ring-2 ring-violet-400"
+                  : "bg-gradient-to-br from-violet-500/10 via-purple-500/5 to-white/40 border-violet-500/20 hover:border-violet-500/50"
+              }`}
+            >
+              <h3
+                className={`text-xs font-extrabold uppercase tracking-wider ${activeMetricFilter === "zeroSales" ? "text-violet-100" : "text-violet-700"}`}
+              >
+                Zero Sales
+              </h3>
+              <p
+                className={`${metricValueClass(stats.zeroSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "zeroSales" ? "text-white" : "text-violet-700"}`}
+              >
+                {formatNumber(stats.zeroSales)}
+              </p>
+              <div
+                className={`mt-2 text-[11px] font-semibold ${activeMetricFilter === "zeroSales" ? "text-violet-200" : "text-violet-600"}`}
               >
                 Click to filter categories
               </div>
@@ -919,7 +1011,7 @@ export default function DashboardPage() {
                 Negative Stock
               </h3>
               <p
-                className={`text-2xl font-black mt-2 ${activeMetricFilter === "negativeStock" ? "text-white" : "text-red-700"}`}
+                className={`${metricValueClass(stats.negativeStock)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "negativeStock" ? "text-white" : "text-red-700"}`}
               >
                 {formatNumber(stats.negativeStock)}
               </p>
@@ -945,7 +1037,7 @@ export default function DashboardPage() {
                 Zero Stock
               </h3>
               <p
-                className={`text-2xl font-black mt-2 ${activeMetricFilter === "zeroStock" ? "text-white" : "text-amber-700"}`}
+                className={`${metricValueClass(stats.zeroStock)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "zeroStock" ? "text-white" : "text-amber-700"}`}
               >
                 {formatNumber(stats.zeroStock)}
               </p>
@@ -1123,7 +1215,8 @@ export default function DashboardPage() {
                         <div className="mt-3 pt-3 border-t border-slate-100">
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
-                              Branch Quantities
+                              {BRANCH_HEADING[activeMetricFilter] ??
+                                "Branch Quantities"}
                             </span>
                             {/* Color-key legend so the two badges in each cell are self-explanatory
         without relying on the title="" tooltip. */}
@@ -1140,8 +1233,14 @@ export default function DashboardPage() {
                             </span>
                           </div>
 
+                          {branchesForMetric(p).length === 0 && (
+                            <p className="text-[11px] font-semibold text-slate-400 py-1">
+                              No branch matches this filter for this product.
+                            </p>
+                          )}
+
                           <div className="grid grid-cols-3 sm:grid-cols-2 gap-2">
-                            {(productData.branches ?? []).map((b) => {
+                            {branchesForMetric(p).map((b) => {
                               const qty = p.branchStock?.[b] ?? 0;
                               const sold = p.branchSales?.[b] ?? 0;
                               return (
@@ -1268,6 +1367,19 @@ export default function DashboardPage() {
                       )}
 
                       {(!activeMetricFilter ||
+                        activeMetricFilter === "zeroSales") && (
+                        <div className="flex items-center justify-between px-3.5 py-2.5 bg-gradient-to-r from-violet-500/15 via-purple-500/10 to-violet-500/5 border border-violet-500/30 rounded-2xl transition-all shadow-[0_2px_8px_rgba(124,58,237,0.04)]">
+                          <span className="flex items-center gap-2 text-xs font-extrabold text-violet-900 uppercase tracking-wide">
+                            <span className="w-2.5 h-2.5 rounded-full bg-violet-600 shadow-[0_0_8px_rgba(124,58,237,0.7)]"></span>
+                            Zero Sales
+                          </span>
+                          <span className="font-black text-violet-950 text-sm">
+                            {formatNumber(cat.zeroSalesCount)}
+                          </span>
+                        </div>
+                      )}
+
+                      {(!activeMetricFilter ||
                         activeMetricFilter === "negativeStock") && (
                         <div className="flex items-center justify-between px-3.5 py-2.5 bg-gradient-to-r from-red-500/15 via-rose-500/10 to-red-500/5 border border-red-500/30 rounded-2xl transition-all shadow-[0_2px_8px_rgba(220,38,38,0.04)]">
                           <span className="flex items-center gap-2 text-xs font-extrabold text-red-900 uppercase tracking-wide">
@@ -1292,6 +1404,7 @@ export default function DashboardPage() {
                           </span>
                         </div>
                       )}
+
                     </div>
                   </div>
                 </div>

@@ -50,19 +50,40 @@ export async function commit({ rows, fileType, batchId, dates }) {
   //
   // stockAsOf moves forward only. A back-dated sheet must not drag it
   // backwards, or products would look less recently counted than they are.
+  // Two derived fields ride along on the upsert that happens anyway, and
+  // together they answer "what is sitting in stock and not selling?" without
+  // scanning a million facts on every dashboard load:
+  //
+  //   inStock     - set from the inventory sheet, which lists the whole
+  //                 catalogue, so it is refreshed wholesale each snapshot.
+  //   lastSoldAt  - the newest day this product sold, written with $max so a
+  //                 back-dated sheet can never drag it backwards.
+  //
+  // Deriving dead stock live costs 5.1s at the top level; reading these costs
+  // 0.24s, and agrees exactly.
   const products = new Map();
+  const lastSold = new Map();
   for (const r of rows) {
     products.set(r.barcode, {
       ...r.product,
-      ...(fileType === "inventory" && isNewer ? { stockAsOf: r.date } : {}),
+      ...(fileType === "inventory" && isNewer
+        ? { stockAsOf: r.date, inStock: r.cells.some((c) => c.qty > 0) }
+        : {}),
     });
+    if (fileType === "sale" && r.cells.length) {
+      const prev = lastSold.get(r.barcode);
+      if (!prev || r.date > prev) lastSold.set(r.barcode, r.date);
+    }
   }
   await chunk([...products.entries()], 1000, (batch) =>
     database.collection(COL.PRODUCTS).bulkWrite(
       batch.map(([barcode, p]) => ({
         updateOne: {
           filter: { _id: barcode },
-          update: fileType === "inventory" ? { $set: p } : { $setOnInsert: p },
+          update: {
+            ...(fileType === "inventory" ? { $set: p } : { $setOnInsert: p }),
+            ...(lastSold.has(barcode) ? { $max: { lastSoldAt: lastSold.get(barcode) } } : {}),
+          },
           upsert: true,
         },
       })),
@@ -518,7 +539,7 @@ export async function compactIndexes(database, collections) {
 /** Filter options and the available date range, recomputed after each upload. */
 export async function rebuildMeta() {
   const database = db();
-  const [types, statuses, categories, range] = await Promise.all([
+  const [types, statuses, categories, range, snapshots] = await Promise.all([
     database.collection(COL.PRODUCTS).distinct("type"),
     database.collection(COL.PRODUCTS).distinct("sellingStatus"),
     database.collection(COL.PRODUCTS).distinct("category"),
@@ -526,15 +547,30 @@ export async function rebuildMeta() {
       .collection(COL.SALES_FACTS)
       .aggregate([{ $group: { _id: null, min: { $min: "$date" }, max: { $max: "$date" } } }])
       .toArray(),
+    database.collection(COL.STOCK_CUBE).distinct("date"),
   ]);
+
+  // The selectable range has to span BOTH kinds of data. Bounded by sales
+  // alone, a stock snapshot taken after the last sales day sits outside every
+  // preset, so "last 30 days" resolved to no snapshot and reported stock as
+  // unknown — while the snapshot sat there, four days later.
+  const salesMin = range[0]?.min ?? null;
+  const salesMax = range[0]?.max ?? null;
+  const stockMin = snapshots.length ? new Date(Math.min(...snapshots)) : null;
+  const stockMax = snapshots.length ? new Date(Math.max(...snapshots)) : null;
+  const earliest = [salesMin, stockMin].filter(Boolean);
+  const latest = [salesMax, stockMax].filter(Boolean);
 
   const doc = {
     branches: BRANCH_CODES,
     types: types.filter(Boolean).sort(),
     statuses: statuses.filter(Boolean).sort(),
     categories: categories.filter(Boolean).sort(),
-    minDate: range[0]?.min ?? null,
-    maxDate: range[0]?.max ?? null,
+    minDate: earliest.length ? new Date(Math.min(...earliest)) : null,
+    maxDate: latest.length ? new Date(Math.max(...latest)) : null,
+    // Kept separately: whether dead stock can take its cheap path depends on
+    // the last SALE, not on the last snapshot.
+    maxSalesDate: salesMax,
     totalProducts: await database.collection(COL.PRODUCTS).estimatedDocumentCount(),
     builtAt: new Date(),
   };
@@ -568,6 +604,8 @@ function rowMatchesMetric(metric) {
       return (r) => (r.negativeStockCount ?? 0) > 0;
     case "zeroStock":
       return (r) => (r.zeroStockCount ?? 0) > 0;
+    case "zeroSales":
+      return (r) => (r.zeroSalesCount ?? 0) > 0;
     default:
       return () => true;
   }
@@ -598,9 +636,105 @@ function productMatchesMetric(metric, { branchesCovered, stockKnown, inCatalogue
         stockKnown &&
         inCatalogue(p.barcode) &&
         Object.keys(p.branchStock).length < branchesCovered;
+    case "zeroSales":
+      // Dead stock: it is on a shelf somewhere and moved nothing.
+      return (p) => stockKnown && p.stock > 0 && p.sale === 0;
     default:
       return () => true;
   }
+}
+
+/**
+ * Products that are in stock but sold nothing in the range — dead stock —
+ * counted per category, or per sub-category once a category is chosen.
+ *
+ * Two ways to get there:
+ *
+ * FAST (0.24s) reads the `lastSoldAt` stamped on each product at upload. It is
+ * only valid when the range runs to the end of the data: "last sold before
+ * `from`" means "sold nothing since `from`", which equals "sold nothing in
+ * [from, to]" only when `to` is at or past the final sale. Every preset is a
+ * trailing window, so this covers the normal case.
+ *
+ * EXACT (0.5-5.1s) unions stock against facts and is used when `to` stops
+ * short, where a stored last-sale date genuinely cannot answer the question.
+ */
+async function readDeadStock({
+  database, branch, type, sellingStatus, from, to, category, stockDate, maxSalesDate,
+}) {
+  const out = new Map();
+  // No snapshot covers the range, so "in stock" is unknown, not false.
+  if (!stockDate) return out;
+
+  const trailing = !to || (maxSalesDate && to >= maxSalesDate);
+  const groupField = category ? "$subCategory" : "$category";
+
+  if (branch === ALL && trailing) {
+    const match = { inStock: true };
+    if (category) match.category = category;
+    if (type !== ALL) match.type = type;
+    if (sellingStatus !== ALL) match.sellingStatus = sellingStatus;
+    // With no lower bound the whole history is in range, so dead stock means
+    // never sold at all. $lt against null would misbehave — undefined sorts
+    // below null in BSON — so the two cases are kept apart.
+    match.$or = from ? [{ lastSoldAt: null }, { lastSoldAt: { $lt: from } }] : [{ lastSoldAt: null }];
+
+    const rows = await database
+      .collection(COL.PRODUCTS)
+      .aggregate([{ $match: match }, { $group: { _id: groupField, n: { $sum: 1 } } }])
+      .toArray();
+    for (const r of rows) out.set(r._id || UNCATEGORIZED, r.n);
+    return out;
+  }
+
+  const stockMatch = { asOf: stockDate, qty: { $gt: 0 } };
+  if (branch !== ALL) stockMatch.branch = branch;
+  if (category) stockMatch.category = category;
+  const saleMatch = {};
+  if (branch !== ALL) saleMatch.branch = branch;
+  if (category) saleMatch.category = category;
+  if (from || to) {
+    saleMatch.date = {};
+    if (from) saleMatch.date.$gte = from;
+    if (to) saleMatch.date.$lte = to;
+  }
+
+  // type and selling status live on products, not on either collection here.
+  if (type !== ALL || sellingStatus !== ALL) {
+    const q = {};
+    if (category) q.category = category;
+    if (type !== ALL) q.type = type;
+    if (sellingStatus !== ALL) q.sellingStatus = sellingStatus;
+    const ids = (await database.collection(COL.PRODUCTS).find(q, { projection: { _id: 1 } }).toArray())
+      .map((x) => x._id);
+    if (!ids.length) return out;
+    stockMatch.barcode = { $in: ids };
+    saleMatch.barcode = { $in: ids };
+  }
+
+  // k=1 marks a stock row, k=0 a sale. $max picks up any stock row, $min any
+  // sale row, so stock=1 with sale=1 means stocked and never sold in range.
+  const rows = await database
+    .collection(COL.INVENTORY_STATE)
+    .aggregate([
+      { $match: stockMatch },
+      { $project: { _id: 0, g: groupField, b: "$barcode", k: { $literal: 1 } } },
+      {
+        $unionWith: {
+          coll: COL.SALES_FACTS,
+          pipeline: [
+            { $match: saleMatch },
+            { $project: { _id: 0, g: groupField, b: "$barcode", k: { $literal: 0 } } },
+          ],
+        },
+      },
+      { $group: { _id: { g: "$g", b: "$b" }, stock: { $max: "$k" }, sale: { $min: "$k" } } },
+      { $match: { stock: 1, sale: 1 } },
+      { $group: { _id: "$_id.g", n: { $sum: 1 } } },
+    ])
+    .toArray();
+  for (const r of rows) out.set(r._id || UNCATEGORIZED, r.n);
+  return out;
 }
 
 /** Every snapshot date held in stock_cube, oldest first. */
@@ -852,10 +986,12 @@ export async function readProducts({
         // Zero somewhere = not stocked at every covered branch, the same
         // definition levels 1 and 2 use.
         zeroStock: a.zeroStock + (inCatalogue && stocked < branchesCovered ? 1 : 0),
+        // In stock, sold nothing over the range.
+        zeroSales: a.zeroSales + (p.stock > 0 && p.sale === 0 ? 1 : 0),
       };
     },
     { totalProducts: 0, totalSales: 0, positiveSales: 0, negativeSales: 0,
-      totalInventory: 0, negativeStock: 0, zeroStock: 0 }
+      totalInventory: 0, negativeStock: 0, zeroStock: 0, zeroSales: 0 }
   );
 
   // Unknown, not zero — same reasoning as levels 1 and 2. Without this every
@@ -864,6 +1000,7 @@ export async function readProducts({
     stats.totalInventory = null;
     stats.negativeStock = null;
     stats.zeroStock = null;
+    stats.zeroSales = null;
   }
 
   const slice = visible.slice((page - 1) * pageSize, page * pageSize);
@@ -992,7 +1129,12 @@ export async function readDashboard({
   const noMatches = barcodeFilter !== null && barcodeFilter.length === 0;
   const noStock = noMatches || !stockDate;
 
-  const [sales, stock, meta] = await Promise.all([
+  // Fetched up front, not alongside the aggregations: dead stock needs the last
+  // sale date to know whether it can take its cheap path, and waiting for the
+  // whole batch before starting it cost a second of serialised time.
+  const meta = await database.collection(COL.META).findOne({ _id: "filters" });
+
+  const [sales, stock, deadStock] = await Promise.all([
     noMatches ? Promise.resolve([]) : drilled
       ? database
           .collection(COL.SALES_FACTS)
@@ -1069,7 +1211,14 @@ export async function readDashboard({
             },
           ])
           .toArray(),
-    database.collection(COL.META).findOne({ _id: "filters" }),
+    noMatches
+      ? Promise.resolve(new Map())
+      : readDeadStock({
+          database, branch, type, sellingStatus, from, to, category,
+          // maxSalesDate, not maxDate: a stock snapshot dated after the last
+          // sale must not make the cheap path look valid past that sale.
+          stockDate, maxSalesDate: meta?.maxSalesDate ?? meta?.maxDate ?? null,
+        }),
   ]);
 
   // Zero stock is derived, never stored — a product the snapshot covered with no
@@ -1098,7 +1247,7 @@ export async function readDashboard({
         categoryName: keyName,
         totalSales: 0, positiveSales: 0, negativeSales: 0,
         totalInventory: 0, productCount: 0,
-        negativeStockCount: 0, zeroStockCount: 0,
+        negativeStockCount: 0, zeroStockCount: 0, zeroSalesCount: 0,
       });
     }
     return merged.get(keyName);
@@ -1126,6 +1275,11 @@ export async function readDashboard({
     }
   }
 
+  // Every dead-stock group needs a row even when it has neither sales nor stock
+  // rows above — a sub-category where nothing sold is exactly what this metric
+  // exists to surface, and it would otherwise be missing from the list.
+  for (const [name, n] of deadStock) slot(name).zeroSalesCount = n;
+
   // A sub-category can have products but no stock rows at all — it still needs
   // a row, with everything at zero, rather than being absent.
   if (drilled) {
@@ -1148,6 +1302,7 @@ export async function readDashboard({
       c.totalInventory = null;
       c.negativeStockCount = null;
       c.zeroStockCount = null;
+      c.zeroSalesCount = null;
     }
   }
 
@@ -1170,9 +1325,10 @@ export async function readDashboard({
       negativeSales: a.negativeSales + c.negativeSales,
       negativeStock: a.negativeStock + (c.negativeStockCount ?? 0),
       zeroStock: a.zeroStock + (c.zeroStockCount ?? 0),
+      zeroSales: a.zeroSales + (c.zeroSalesCount ?? 0),
     }),
     { totalProducts: 0, totalInventory: 0, totalSales: 0, positiveSales: 0,
-      negativeSales: 0, negativeStock: 0, zeroStock: 0 }
+      negativeSales: 0, negativeStock: 0, zeroStock: 0, zeroSales: 0 }
   );
 
   // The headline cards get the same treatment, for the same reason.
@@ -1180,6 +1336,7 @@ export async function readDashboard({
     stats.totalInventory = null;
     stats.negativeStock = null;
     stats.zeroStock = null;
+    stats.zeroSales = null;
   }
 
   return {
