@@ -30,6 +30,7 @@ export const COL = {
   STOCK_CUBE: "stock_cube",
   BATCHES: "upload_batches",
   META: "meta",
+  USERS: "users",
 };
 
 /**
@@ -256,6 +257,10 @@ async function applySchema(db) {
       { status: 1 },
       { name: "one_running_at_a_time", unique: true, partialFilterExpression: { status: "running" } }
     ),
+    // Login looks users up by email, and the uniqueness is the real point:
+    // without it a second account could be created on an existing address and
+    // whichever record the query happened to return would decide the role.
+    index(COL.USERS, { email: 1 }, { name: "email_unique", unique: true }),
   ]);
 
   // Seed the branch registry.

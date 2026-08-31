@@ -1,30 +1,62 @@
 import { NextResponse } from "next/server";
+import mongoose from "mongoose";
+import dbConnect from "@/lib/mongodb";
+import { COL, ensureSchema } from "@/lib/schema";
+import { verifyPassword } from "@/lib/password";
+import { signSession, SESSION_COOKIE, SESSION_MAX_AGE } from "@/lib/session";
+import { findUserByEmail, seedAdminIfEmpty, publicUser } from "@/lib/users";
+
+export const runtime = "nodejs";
 
 export async function POST(req) {
   try {
-    const { username, password } = await req.json();
+    await dbConnect();
+    await ensureSchema(mongoose.connection.db);
 
-    const validUsername = process.env.ADMIN_USERNAME || "admin";
-    const validPassword = process.env.ADMIN_PASSWORD || "password";
+    // Bootstraps the first admin from ADMIN_USERNAME/ADMIN_PASSWORD, and only
+    // while no users exist at all.
+    await seedAdminIfEmpty();
 
-    if (username === validUsername && password === validPassword) {
-      const response = NextResponse.json({ success: true, message: "Logged in successfully" });
-      
-      // Set a secure HTTP-only session cookie lasting 7 days
-      response.cookies.set({
-        name: "auth_token",
-        value: "authenticated_session_active",
-        httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        path: "/",
-        maxAge: 60 * 60 * 24 * 7, 
-      });
+    const body = await req.json().catch(() => ({}));
+    // `username` is still accepted so an old cached login page keeps working.
+    const email = body.email ?? body.username;
+    const password = body.password;
 
-      return response;
+    const user = await findUserByEmail(email);
+    const ok = user && !user.disabled && (await verifyPassword(password, user.passwordHash, user.salt));
+
+    // One message for every failure. Distinguishing "no such account" from
+    // "wrong password" turns the login form into a way to enumerate who has one.
+    if (!ok) {
+      return NextResponse.json(
+        { success: false, error: "Incorrect email or password." },
+        { status: 401 }
+      );
     }
 
-    return NextResponse.json({ success: false, error: "Invalid username or password" }, { status: 401 });
-  } catch (err) {
+    await mongoose.connection.db
+      .collection(COL.USERS)
+      .updateOne({ _id: user._id }, { $set: { lastLoginAt: new Date() } });
+
+    const token = await signSession({
+      userId: String(user._id),
+      email: user.email,
+      role: user.role,
+    });
+
+    const response = NextResponse.json({ success: true, user: publicUser(user) });
+    response.cookies.set({
+      name: SESSION_COOKIE,
+      value: token,
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      path: "/",
+      maxAge: SESSION_MAX_AGE,
+    });
+    return response;
+  } catch (error) {
+    console.error("Login error:", error);
     return NextResponse.json({ success: false, error: "Server authentication error" }, { status: 500 });
   }
 }

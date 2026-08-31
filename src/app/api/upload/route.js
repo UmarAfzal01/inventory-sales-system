@@ -7,6 +7,7 @@ import dbConnect from "@/lib/mongodb";
 import { COL, ensureSchema } from "@/lib/schema";
 import { validateFile, validateHeaders, parseRow, parseIsoDate, normHeader, dateSlug } from "@/lib/ingest";
 import { commit, rebuildMeta, compactIndexes } from "@/lib/warehouse";
+import { requireUser } from "@/lib/guard";
 
 // SheetJS's streaming reader needs Node's Readable handed to it explicitly.
 // Under Next's bundler it is not auto-detected, and to_json fails with
@@ -20,6 +21,12 @@ export const maxDuration = 300;
 
 export async function POST(req) {
   try {
+    // Uploading rewrites the warehouse, so it is admin-only. Checked here and
+    // not only in middleware, which does not run for every path an API route
+    // can be reached by.
+    const { user, error: authError } = await requireUser(req, { admin: true });
+    if (authError) return authError;
+
     await dbConnect();
     const database = mongoose.connection.db;
     // Forced here, unlike on the read path: an upload is rare and slow enough
@@ -214,6 +221,7 @@ export async function POST(req) {
       fileName: file.name ?? "upload.xlsx",
       fileSize: buffer.length,
       fileType,
+      uploadedBy: user.email,
       dates,
       totalRows,
       usableRows: rows.length,

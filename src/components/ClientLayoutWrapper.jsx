@@ -13,6 +13,33 @@ export default function ClientLayoutWrapper({ children }) {
   const searchParams = useSearchParams();
   const currentBranch = searchParams.get("branch");
 
+  // Who is signed in, so the chrome can hide what this account cannot do.
+  // Cosmetic only — every route enforces the same rule server-side, because a
+  // hidden button is not a permission.
+  const [me, setMe] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/auth/me")
+      .then((r) => r.json())
+      .then((j) => {
+        if (cancelled) return;
+        if (j.success) {
+          setMe(j.user);
+          return;
+        }
+        // A session the server will not accept — expired, signed with a
+        // rotated secret, or left over from before sessions were signed.
+        // Without this the page just renders without the admin controls, which
+        // looks like a permissions bug rather than a login that lapsed.
+        router.replace("/login");
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
+  const isAdminUser = me?.role === "admin";
+
   // Changing branch must keep every other parameter — category, sub-category,
   // dates, type, status. Linking to a bare /dashboard?branch=X threw the user
   // back to the top level and silently dropped their filters.
@@ -71,11 +98,16 @@ export default function ClientLayoutWrapper({ children }) {
 
   const handleSignOut = async () => {
     try {
-      document.cookie = "auth_token=; path=/; max-age=0;";
-      router.push("/login");
-      router.refresh();
+      // The session cookie is httpOnly, so document.cookie cannot remove it —
+      // the previous version appeared to sign out, then middleware saw the
+      // still-valid cookie and sent you straight back to the dashboard.
+      // Only the server can expire it.
+      await fetch("/api/auth/logout", { method: "POST" });
     } catch (err) {
       console.error("Failed to sign out:", err);
+    } finally {
+      router.push("/login");
+      router.refresh();
     }
   };
 
@@ -105,7 +137,18 @@ export default function ClientLayoutWrapper({ children }) {
                   Headquarter
                 </span>
                 <h2 className="text-base font-extrabold text-slate-900 mt-2.5 tracking-tight">Rainbow AI Portal</h2>
-                <p className="text-xs text-slate-500 font-medium mt-0.5">User: hq_admin</p>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">
+                  {me ? me.email : "Signing in…"}
+                </p>
+                {me && (
+                  <span className={`inline-block mt-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider ${
+                    isAdminUser
+                      ? "bg-blue-500/10 text-blue-700"
+                      : "bg-slate-100 text-slate-600"
+                  }`}>
+                    {isAdminUser ? "Admin" : "Viewer"}
+                  </span>
+                )}
               </div>
             </div>
 
@@ -215,7 +258,28 @@ export default function ClientLayoutWrapper({ children }) {
             <span>{sidebarOpen ? "Hide Sidebar" : "Show Sidebar"}</span>
           </button>
 
-          {/* UPLOAD BUTTON */}
+          {/* Admin actions, grouped so they read as one cluster rather than
+              being spread apart by the header's justify-between. */}
+          <div className="flex items-center gap-3">
+          {isAdminUser && (
+            <Link
+              href="/users"
+              className="group relative px-5 py-2.5 bg-gradient-to-r from-white/60 via-white/40 to-blue-50/50 hover:from-white/80 hover:to-blue-100/60 text-blue-900 font-extrabold text-xs rounded-2xl backdrop-blur-2xl border border-white/80 shadow-[0_8px_25px_rgba(37,99,235,0.12),inset_0_1px_1px_rgba(255,255,255,0.9)] hover:shadow-[0_12px_30px_rgba(37,99,235,0.22),inset_0_1px_1px_rgba(255,255,255,1)] transition-all duration-300 transform hover:-translate-y-0.5 active:translate-y-0 flex items-center gap-2.5 overflow-hidden"
+            >
+              <div className="absolute inset-x-0 top-0 h-[1px] bg-gradient-to-r from-transparent via-white to-transparent opacity-80"></div>
+
+              <span className="w-6 h-6 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white flex items-center justify-center shadow-[0_4px_12px_rgba(37,99,235,0.3)] group-hover:scale-110 transition-transform duration-300">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                </svg>
+              </span>
+
+              <span className="tracking-tight font-bold">Users</span>
+            </Link>
+          )}
+
+          {/* UPLOAD BUTTON - admins only; viewers are read-only. */}
+          {isAdminUser && (
           <button
             onClick={() => setIsUploadOpen(true)}
             className="group relative px-5 py-2.5 bg-gradient-to-r from-white/60 via-white/40 to-blue-50/50 hover:from-white/80 hover:to-blue-100/60 text-blue-900 font-extrabold text-xs rounded-2xl backdrop-blur-2xl border border-white/80 shadow-[0_8px_25px_rgba(37,99,235,0.12),inset_0_1px_1px_rgba(255,255,255,0.9)] hover:shadow-[0_12px_30px_rgba(37,99,235,0.22),inset_0_1px_1px_rgba(255,255,255,1)] transition-all duration-300 transform hover:-translate-y-0.5 active:translate-y-0 flex items-center gap-2.5 overflow-hidden cursor-pointer"
@@ -230,13 +294,15 @@ export default function ClientLayoutWrapper({ children }) {
 
             <span className="tracking-tight font-bold">Upload Excel Data</span>
           </button>
+          )}
+          </div>
         </div>
 
         {children}
       </main>
 
       {/* RIGHT-SIDE SLIDE-OVER DRAWER OVERLAY */}
-      {isUploadOpen && (
+      {isUploadOpen && isAdminUser && (
         <div 
           className="fixed inset-0 z-50 bg-slate-900/30 backdrop-blur-sm transition-opacity"
           onClick={() => setIsUploadOpen(false)}

@@ -4,6 +4,7 @@ import dbConnect from "@/lib/mongodb";
 import { ensureSchema } from "@/lib/schema";
 import { parseIsoDate } from "@/lib/ingest";
 import { readDashboard, readProducts } from "@/lib/warehouse";
+import { requireUser } from "@/lib/guard";
 
 export const runtime = "nodejs";
 
@@ -15,6 +16,10 @@ export const runtime = "nodejs";
  */
 export async function GET(req) {
   try {
+    // Any signed-in account may read; viewers exist precisely for this.
+    const { error: authError } = await requireUser(req);
+    if (authError) return authError;
+
     await dbConnect();
     await ensureSchema(mongoose.connection.db);
 
