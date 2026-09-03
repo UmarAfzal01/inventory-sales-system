@@ -1,6 +1,12 @@
 import mongoose from "mongoose";
 import { COL, BRANCH_CODES, UNCATEGORIZED } from "@/lib/schema";
 import { dateSlug } from "@/lib/ingest";
+import {
+  UNRESTRICTED,
+  resolveAllowed,
+  condition,
+  isEmptyScope,
+} from "@/lib/scope";
 
 const db = () => mongoose.connection.db;
 export const ALL = "ALL";
@@ -661,6 +667,7 @@ function productMatchesMetric(metric, { branchesCovered, stockKnown, inCatalogue
  */
 async function readDeadStock({
   database, branch, type, sellingStatus, from, to, category, stockDate, maxSalesDate,
+  scope = UNRESTRICTED,
 }) {
   const out = new Map();
   // No snapshot covers the range, so "in stock" is unknown, not false.
@@ -669,11 +676,16 @@ async function readDeadStock({
   const trailing = !to || (maxSalesDate && to >= maxSalesDate);
   const groupField = category ? "$subCategory" : "$category";
 
-  if (branch === ALL && trailing) {
+  // The cheap path needs the whole estate; a branch-scoped user has to be
+  // counted per branch, so it falls through to the exact union below.
+  if (branch === ALL && trailing && !scope.branches) {
     const match = { inStock: true };
     if (category) match.category = category;
     if (type !== ALL) match.type = type;
     if (sellingStatus !== ALL) match.sellingStatus = sellingStatus;
+    if (scope.categories && !category) match.category = { $in: scope.categories };
+    if (scope.subCategories) match.subCategory = { $in: scope.subCategories };
+    if (scope.products) match._id = { $in: scope.products };
     // With no lower bound the whole history is in range, so dead stock means
     // never sold at all. $lt against null would misbehave — undefined sorts
     // below null in BSON — so the two cases are kept apart.
@@ -687,12 +699,21 @@ async function readDeadStock({
     return out;
   }
 
+  const dBranch = condition(resolveAllowed(branch, scope.branches));
+  const dCategory = condition(resolveAllowed(category ?? ALL, scope.categories));
+  const dSub = condition(scope.subCategories ? [...scope.subCategories] : null);
+  const dProduct = condition(scope.products ? [...scope.products] : null);
+
   const stockMatch = { asOf: stockDate, qty: { $gt: 0 } };
-  if (branch !== ALL) stockMatch.branch = branch;
-  if (category) stockMatch.category = category;
+  if (dBranch !== undefined) stockMatch.branch = dBranch;
+  if (dCategory !== undefined) stockMatch.category = dCategory;
+  if (dSub !== undefined) stockMatch.subCategory = dSub;
+  if (dProduct !== undefined) stockMatch.barcode = dProduct;
   const saleMatch = {};
-  if (branch !== ALL) saleMatch.branch = branch;
-  if (category) saleMatch.category = category;
+  if (dBranch !== undefined) saleMatch.branch = dBranch;
+  if (dCategory !== undefined) saleMatch.category = dCategory;
+  if (dSub !== undefined) saleMatch.subCategory = dSub;
+  if (dProduct !== undefined) saleMatch.barcode = dProduct;
   if (from || to) {
     saleMatch.date = {};
     if (from) saleMatch.date.$gte = from;
@@ -782,6 +803,7 @@ export async function readProducts({
   page = 1,
   pageSize = 50,
   metricFilter = null,
+  scope = UNRESTRICTED,
 } = {}) {
   const database = db();
   // category / subCategory are optional. With neither, this is a global product
@@ -799,6 +821,9 @@ export async function readProducts({
     if (sub !== null) q.subCategory = sub;
     if (type !== ALL) q.type = type;
     if (sellingStatus !== ALL) q.sellingStatus = sellingStatus;
+    if (scope.products) q._id = { $in: scope.products };
+    if (scope.categories && !scoped) q.category = { $in: scope.categories };
+    if (scope.subCategories && sub === null) q.subCategory = { $in: scope.subCategories };
     const ids = await database
       .collection(COL.PRODUCTS)
       .find(q, { projection: { _id: 1 } })
@@ -809,10 +834,22 @@ export async function readProducts({
     }
   }
 
+  // Scope resolved the same way as level 1/2: an empty list means the request
+  // fell outside what this account may see, so nothing is returned.
+  const pBranchIn = resolveAllowed(branch, scope.branches);
+  const pCategoryIn = resolveAllowed(scoped ? category : ALL, scope.categories);
+  const pSubIn = resolveAllowed(sub !== null ? sub : ALL, scope.subCategories);
+  const pOutOfScope = isEmptyScope(pBranchIn, pCategoryIn, pSubIn);
+  const pBranch = condition(pBranchIn);
+  const pCategory = condition(pCategoryIn);
+  const pSub = condition(pSubIn);
+  const pProduct = condition(scope.products ? [...scope.products] : null);
+
   const salesMatch = {};
-  if (scoped) salesMatch.category = category;
-  if (sub !== null) salesMatch.subCategory = sub;
-  if (branch !== ALL) salesMatch.branch = branch;
+  if (pCategory !== undefined) salesMatch.category = pCategory;
+  if (pSub !== undefined) salesMatch.subCategory = pSub;
+  if (pBranch !== undefined) salesMatch.branch = pBranch;
+  if (pProduct !== undefined) salesMatch.barcode = pProduct;
   if (barcodeFilter) salesMatch.barcode = { $in: barcodeFilter };
   if (from || to) {
     salesMatch.date = {};
@@ -829,14 +866,16 @@ export async function readProducts({
   // says so, rather than quietly showing today's count under an older date.
   const stockDate = await resolveStockDate(database, to);
   const stockMatch = { asOf: stockDate };
-  if (scoped) stockMatch.category = category;
-  if (sub !== null) stockMatch.subCategory = sub;
-  if (branch !== ALL) stockMatch.branch = branch;
+  if (pCategory !== undefined) stockMatch.category = pCategory;
+  if (pSub !== undefined) stockMatch.subCategory = pSub;
+  if (pBranch !== undefined) stockMatch.branch = pBranch;
+  if (pProduct !== undefined) stockMatch.barcode = pProduct;
   if (barcodeFilter) stockMatch.barcode = { $in: barcodeFilter };
 
   const catalogueQuery = { stockAsOf: { $ne: null } };
-  if (scoped) catalogueQuery.category = category;
-  if (sub !== null) catalogueQuery.subCategory = sub;
+  if (pCategory !== undefined) catalogueQuery.category = pCategory;
+  if (pSub !== undefined) catalogueQuery.subCategory = pSub;
+  if (pProduct !== undefined) catalogueQuery._id = pProduct;
   if (type !== ALL) catalogueQuery.type = type;
   if (sellingStatus !== ALL) catalogueQuery.sellingStatus = sellingStatus;
 
@@ -852,6 +891,10 @@ export async function readProducts({
       { _id: { $regex: "^" + searchTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") } },
       { articleName: { $regex: searchTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } },
     ];
+  }
+
+  if (pOutOfScope) {
+    return { products: [], total: 0, page, pageSize, stats: null, branches: [], stockDate: null, unfilteredTotal: 0 };
   }
 
   const catalogue = await database
@@ -897,7 +940,10 @@ export async function readProducts({
           ])
           .toArray()
       : Promise.resolve([]),
-    database.collection(COL.COVERAGE).distinct("branch"),
+    database
+      .collection(COL.COVERAGE)
+      .distinct("branch")
+      .then((all) => (scope.branches ? all.filter((b) => scope.branches.includes(b)) : all)),
   ]);
 
   // Seed from the catalogue, not from the facts.
@@ -1060,14 +1106,25 @@ export async function readDashboard({
   to = null,
   category = null,
   metricFilter = null,
+  scope = UNRESTRICTED,
 } = {}) {
   const database = db();
 
+  // The user's scope is folded into the queries themselves, so out-of-scope
+  // rows are never read. An empty array back from resolveAllowed means the
+  // request fell outside what this account may see — which has to mean "no
+  // rows", never "no filter".
+  const branchIn = resolveAllowed(branch, scope.branches);
+  const categoryIn = resolveAllowed(category, scope.categories);
+  const outOfScope = isEmptyScope(branchIn, categoryIn);
+
   const cubeMatch = {};
-  if (branch !== ALL) cubeMatch.branch = branch;
+  const branchCond = condition(branchIn);
+  if (branchCond !== undefined) cubeMatch.branch = branchCond;
   if (type !== ALL) cubeMatch.type = type;
   if (sellingStatus !== ALL) cubeMatch.sellingStatus = sellingStatus;
-  if (category) cubeMatch.category = category;
+  const categoryCond = condition(categoryIn);
+  if (categoryCond !== undefined) cubeMatch.category = categoryCond;
   if (from || to) {
     cubeMatch.date = {};
     if (from) cubeMatch.date.$gte = from;
@@ -1079,10 +1136,16 @@ export async function readDashboard({
   // stock figures are omitted rather than silently showing a later count.
   const stockDate = await resolveStockDate(database, to);
 
-  const stockMatch = stockDate ? { date: stockDate, branch } : { _id: null };
+  // stock_cube stores a pre-aggregated branch:"ALL" row so product counts are
+  // not double-counted across branches. That row is only usable when the view
+  // really is every branch — a user restricted to a subset must be counted from
+  // inventory_state instead, which is what `useStateForStock` below selects.
+  const stockMatch = stockDate
+    ? { date: stockDate, branch: branchIn === null ? ALL : branchIn[0] }
+    : { _id: null };
   if (type !== ALL) stockMatch.type = type;
   if (sellingStatus !== ALL) stockMatch.sellingStatus = sellingStatus;
-  if (category) stockMatch.category = category;
+  if (categoryCond !== undefined) stockMatch.category = categoryCond;
 
   // Level 1 (categories) reads the cubes. Level 2 (sub-categories within one
   // category) reads the FACTS instead, because sub-category is deliberately not
@@ -1097,22 +1160,34 @@ export async function readDashboard({
   // level above, and show more than they asked for.
   // How many branches the snapshot covered. Zero stock at "All branches" means
   // a product is missing a reading at at least one of them.
-  const branchCount =
-    branch === ALL
-      ? (await database.collection(COL.COVERAGE).distinct("branch")).length || BRANCH_CODES.length
-      : 1;
+  // "Stocked everywhere" is measured against the branches this user can see. A
+  // user scoped to two branches must not have a product counted as zero-stock
+  // because it is absent from a third they are not allowed to look at.
+  const coveredBranches =
+    (await database.collection(COL.COVERAGE).distinct("branch")).length || BRANCH_CODES.length;
+  const branchCount = branchIn === null ? coveredBranches : branchIn.length;
+
+  // Sub-category and product restrictions apply to every fact- and
+  // state-derived figure below.
+  const subCond = condition(scope.subCategories ? [...scope.subCategories] : null);
+  const productCond = condition(scope.products ? [...scope.products] : null);
 
   let barcodeFilter = null;
   if (drilled && (type !== ALL || sellingStatus !== ALL)) {
     const q = { category };
     if (type !== ALL) q.type = type;
     if (sellingStatus !== ALL) q.sellingStatus = sellingStatus;
+    if (subCond !== undefined) q.subCategory = subCond;
+    if (productCond !== undefined) q._id = productCond;
     const ids = await database.collection(COL.PRODUCTS).find(q, { projection: { _id: 1 } }).toArray();
     barcodeFilter = ids.map((x) => x._id);
   }
 
-  const factSalesMatch = { category };
-  if (branch !== ALL) factSalesMatch.branch = branch;
+  const factSalesMatch = {};
+  if (categoryCond !== undefined) factSalesMatch.category = categoryCond;
+  if (branchCond !== undefined) factSalesMatch.branch = branchCond;
+  if (subCond !== undefined) factSalesMatch.subCategory = subCond;
+  if (productCond !== undefined) factSalesMatch.barcode = productCond;
   if (barcodeFilter) factSalesMatch.barcode = { $in: barcodeFilter };
   if (from || to) {
     factSalesMatch.date = {};
@@ -1122,11 +1197,25 @@ export async function readDashboard({
   // Same rule as level 1 and level 3: the held snapshot counts only when it is
   // the one the date range resolves to. Without this, drilling into a category
   // showed today's stock beside level 1's correctly-empty figure.
-  const factStockMatch = { category, asOf: stockDate };
-  if (branch !== ALL) factStockMatch.branch = branch;
+  const factStockMatch = { asOf: stockDate };
+  if (categoryCond !== undefined) factStockMatch.category = categoryCond;
+  if (branchCond !== undefined) factStockMatch.branch = branchCond;
+  if (subCond !== undefined) factStockMatch.subCategory = subCond;
+  if (productCond !== undefined) factStockMatch.barcode = productCond;
   if (barcodeFilter) factStockMatch.barcode = { $in: barcodeFilter };
 
-  const noMatches = barcodeFilter !== null && barcodeFilter.length === 0;
+  // Stock comes from inventory_state whenever the pre-aggregated ALL row cannot
+  // be used: drilled into a category, or scoped to a subset of branches.
+  const useStateForStock =
+    drilled || (branchIn !== null && branchIn.length > 1) || subCond !== undefined || productCond !== undefined;
+  const stockGroupField = drilled ? "$subCategory" : "$category";
+
+  // daily_cube has no sub-category or barcode dimension, so any scope narrower
+  // than whole categories has to be answered from the facts instead.
+  const useFactsForSales = drilled || subCond !== undefined || productCond !== undefined;
+  const salesGroupField = drilled ? "$subCategory" : "$category";
+
+  const noMatches = (barcodeFilter !== null && barcodeFilter.length === 0) || outOfScope;
   const noStock = noMatches || !stockDate;
 
   // Fetched up front, not alongside the aggregations: dead stock needs the last
@@ -1135,14 +1224,14 @@ export async function readDashboard({
   const meta = await database.collection(COL.META).findOne({ _id: "filters" });
 
   const [sales, stock, deadStock] = await Promise.all([
-    noMatches ? Promise.resolve([]) : drilled
+    noMatches ? Promise.resolve([]) : useFactsForSales
       ? database
           .collection(COL.SALES_FACTS)
           .aggregate([
             { $match: factSalesMatch },
             {
               $group: {
-                _id: "$subCategory",
+                _id: salesGroupField,
                 totalSales: { $sum: "$qty" },
                 positiveSales: { $sum: { $cond: [{ $gt: ["$qty", 0] }, "$qty", 0] } },
                 negativeSales: { $sum: { $cond: [{ $lt: ["$qty", 0] }, "$qty", 0] } },
@@ -1164,7 +1253,7 @@ export async function readDashboard({
             },
           ])
           .toArray(),
-    noStock ? Promise.resolve([]) : drilled
+    noStock ? Promise.resolve([]) : useStateForStock
       ? database
           .collection(COL.INVENTORY_STATE)
           .aggregate([
@@ -1174,7 +1263,7 @@ export async function readDashboard({
             // report it eight times under "All Branches".
             {
               $group: {
-                _id: { sub: "$subCategory", barcode: "$barcode" },
+                _id: { sub: stockGroupField, barcode: "$barcode" },
                 qty: { $sum: "$qty" },
                 branchesWithStock: { $sum: 1 },
                 neg: { $max: { $cond: [{ $lt: ["$qty", 0] }, 1, 0] } },
@@ -1214,7 +1303,7 @@ export async function readDashboard({
     noMatches
       ? Promise.resolve(new Map())
       : readDeadStock({
-          database, branch, type, sellingStatus, from, to, category,
+          database, branch, type, sellingStatus, from, to, category, scope,
           // maxSalesDate, not maxDate: a stock snapshot dated after the last
           // sale must not make the cheap path look valid past that sale.
           stockDate, maxSalesDate: meta?.maxSalesDate ?? meta?.maxDate ?? null,
@@ -1225,15 +1314,23 @@ export async function readDashboard({
   // non-zero reading read zero. At level 2 that needs the full product count per
   // sub-category, which only `products` knows.
   let subProductCounts = new Map();
-  if (drilled && !noMatches) {
-    const q = { category, stockAsOf: { $ne: null } };
+  if (useStateForStock && !noMatches) {
+    const q = { stockAsOf: { $ne: null } };
+    if (categoryCond !== undefined) q.category = categoryCond;
     if (type !== ALL) q.type = type;
     if (sellingStatus !== ALL) q.sellingStatus = sellingStatus;
+    if (subCond !== undefined) q.subCategory = subCond;
+    if (productCond !== undefined) q._id = productCond;
     const rows = await database
       .collection(COL.PRODUCTS)
       .aggregate([
         { $match: q },
-        { $group: { _id: { $ifNull: ["$subCategory", ""] }, n: { $sum: 1 } } },
+        {
+          $group: {
+            _id: { $ifNull: [drilled ? "$subCategory" : "$category", ""] },
+            n: { $sum: 1 },
+          },
+        },
       ])
       .toArray();
     subProductCounts = new Map(rows.map((r) => [r._id, r.n]));
@@ -1258,7 +1355,10 @@ export async function readDashboard({
   });
   for (const s of stock) {
     const t = slot(s._id);
-    if (drilled) {
+    // Keyed off the same switch that chose the source. Reading the cube's shape
+    // from an inventory_state result left productCount undefined, which surfaced
+    // as a null product count the moment any scope was applied.
+    if (useStateForStock) {
       const total = subProductCounts.get(s._id ?? "") ?? s.withStock ?? 0;
       // Zero somewhere = not stocked at every covered branch. For a single
       // branch that reduces to "has no reading here", which is the same thing.
@@ -1282,7 +1382,7 @@ export async function readDashboard({
 
   // A sub-category can have products but no stock rows at all — it still needs
   // a row, with everything at zero, rather than being absent.
-  if (drilled) {
+  if (useStateForStock) {
     for (const [sub, total] of subProductCounts) {
       const t = slot(sub);
       if (t.productCount === 0) {
@@ -1349,7 +1449,14 @@ export async function readDashboard({
     stats,
     categories,
     filtersList: {
-      branches: meta?.branches ?? BRANCH_CODES,
+      // Restricted to the scope, so the dropdowns cannot offer a branch or
+      // category that every query would then refuse to answer.
+      branches: (meta?.branches ?? BRANCH_CODES).filter(
+        (b) => !scope.branches || scope.branches.includes(b)
+      ),
+      categories: (meta?.categories ?? []).filter(
+        (c) => !scope.categories || scope.categories.includes(c)
+      ),
       types: meta?.types ?? [],
       statuses: meta?.statuses ?? [],
       minDate: meta?.minDate ?? null,

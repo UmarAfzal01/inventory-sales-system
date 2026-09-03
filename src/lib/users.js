@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import { COL } from "@/lib/schema";
 import { hashPassword, validatePassword } from "@/lib/password";
 import { ROLES } from "@/lib/session";
+import { sanitiseScope } from "@/lib/scope";
 
 const db = () => mongoose.connection.db;
 
@@ -24,6 +25,7 @@ export const publicUser = (u) =>
     email: u.email,
     role: u.role,
     disabled: Boolean(u.disabled),
+    scope: u.scope ?? { branches: [], categories: [], subCategories: [], products: [] },
     createdAt: u.createdAt,
     createdBy: u.createdBy ?? null,
     lastLoginAt: u.lastLoginAt ?? null,
@@ -46,7 +48,9 @@ export async function listUsers() {
  * Creates a user. Returns `{ error }` for anything the caller should show,
  * rather than throwing — a duplicate email is an ordinary outcome of a form.
  */
-export async function createUser({ email, password, role = ROLES.VIEWER, createdBy = null }) {
+export async function createUser({
+  email, password, role = ROLES.VIEWER, createdBy = null, scope = null,
+}) {
   const emailError = validateEmail(email);
   if (emailError) return { error: emailError };
   const passwordError = validatePassword(password);
@@ -59,6 +63,9 @@ export async function createUser({ email, password, role = ROLES.VIEWER, created
     passwordHash,
     salt,
     role,
+    // Empty lists mean unrestricted, so a new user starts with full visibility
+    // until the admin narrows it.
+    scope: sanitiseScope(scope),
     disabled: false,
     createdAt: new Date(),
     createdBy,

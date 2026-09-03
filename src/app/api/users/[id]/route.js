@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { COL } from "@/lib/schema";
 import { requireUser } from "@/lib/guard";
 import { setPassword, publicUser } from "@/lib/users";
+import { sanitiseScope } from "@/lib/scope";
 
 export const runtime = "nodejs";
 
@@ -22,7 +23,21 @@ const oid = (id) => {
  */
 const isSelf = (actor, id) => String(actor._id) === String(id);
 
-/** Disable, re-enable, change role, or reset a password. */
+/** One user, for the edit page. */
+export async function GET(req, { params }) {
+  const { error } = await requireUser(req, { admin: true });
+  if (error) return error;
+
+  const { id } = await params;
+  const _id = oid(id);
+  if (!_id) return NextResponse.json({ success: false, error: "Unknown user." }, { status: 404 });
+
+  const user = await mongoose.connection.db.collection(COL.USERS).findOne({ _id });
+  if (!user) return NextResponse.json({ success: false, error: "Unknown user." }, { status: 404 });
+  return NextResponse.json({ success: true, user: publicUser(user) });
+}
+
+/** Disable, re-enable, edit access, or reset a password. */
 export async function PATCH(req, { params }) {
   const { user: actor, error } = await requireUser(req, { admin: true });
   if (error) return error;
@@ -44,14 +59,18 @@ export async function PATCH(req, { params }) {
     update.disabled = body.disabled;
   }
 
-  if (body.role === "admin" || body.role === "viewer") {
-    if (isSelf(actor, _id) && body.role !== "admin") {
+  // Roles are deliberately not editable: the system has one admin, seeded once.
+  // Promotion was removed rather than guarded, so there is no path to a second
+  // administrator at all.
+
+  if (body.scope) {
+    if (isSelf(actor, _id)) {
       return NextResponse.json(
-        { success: false, error: "You cannot remove your own admin access." },
+        { success: false, error: "The admin account cannot be scoped." },
         { status: 400 }
       );
     }
-    update.role = body.role;
+    update.scope = sanitiseScope(body.scope);
   }
 
   if (body.newPassword) {

@@ -5,6 +5,7 @@ import { ensureSchema } from "@/lib/schema";
 import { parseIsoDate } from "@/lib/ingest";
 import { readDashboard, readProducts } from "@/lib/warehouse";
 import { requireUser } from "@/lib/guard";
+import { effectiveScope } from "@/lib/scope";
 
 export const runtime = "nodejs";
 
@@ -17,8 +18,10 @@ export const runtime = "nodejs";
 export async function GET(req) {
   try {
     // Any signed-in account may read; viewers exist precisely for this.
-    const { error: authError } = await requireUser(req);
+    const { user, error: authError } = await requireUser(req);
     if (authError) return authError;
+    // Resolved from the stored record on every request, never from the client.
+    const scope = effectiveScope(user);
 
     await dbConnect();
     await ensureSchema(mongoose.connection.db);
@@ -50,6 +53,7 @@ export async function GET(req) {
         subCategory,
         q: search,
         metricFilter,
+        scope,
         page: Math.max(1, parseInt(q.get("page") || "1", 10) || 1),
         pageSize: Math.min(200, Math.max(1, parseInt(q.get("pageSize") || "50", 10) || 50)),
       });
@@ -64,6 +68,7 @@ export async function GET(req) {
       to: parseIsoDate(q.get("to")),
       category,
       metricFilter,
+      scope,
     });
 
     if (!data.ready) {

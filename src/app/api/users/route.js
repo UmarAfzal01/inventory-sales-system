@@ -18,13 +18,15 @@ export async function POST(req) {
   if (error) return error;
   await ensureSchema(mongoose.connection.db);
 
-  const { email, password, role } = await req.json().catch(() => ({}));
+  const { email, password, scope } = await req.json().catch(() => ({}));
   const result = await createUser({
     email,
     password,
-    // Anything that is not explicitly "admin" becomes a viewer, so a typo or a
-    // crafted request cannot mint an administrator.
-    role: role === ROLES.ADMIN ? ROLES.ADMIN : ROLES.VIEWER,
+    // There is exactly one admin — the seeded account. Every user created
+    // through this route is a viewer, whatever the request body claims, so no
+    // crafted request can mint a second administrator.
+    role: ROLES.VIEWER,
+    scope,
     createdBy: user.email,
   });
   if (result.error) return NextResponse.json({ success: false, error: result.error }, { status: 400 });
