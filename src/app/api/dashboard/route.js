@@ -22,6 +22,9 @@ export async function GET(req) {
     if (authError) return authError;
     // Resolved from the stored record on every request, never from the client.
     const scope = effectiveScope(user);
+    // Revenue is admin-only. Passed as a flag rather than stripped afterwards,
+    // so it is never computed or serialised for anyone else.
+    const includeAmount = user.role === "admin";
 
     await dbConnect();
     await ensureSchema(mongoose.connection.db);
@@ -54,6 +57,7 @@ export async function GET(req) {
         q: search,
         metricFilter,
         scope,
+        includeAmount,
         page: Math.max(1, parseInt(q.get("page") || "1", 10) || 1),
         pageSize: Math.min(200, Math.max(1, parseInt(q.get("pageSize") || "50", 10) || 50)),
       });
@@ -69,6 +73,7 @@ export async function GET(req) {
       category,
       metricFilter,
       scope,
+      includeAmount,
     });
 
     if (!data.ready) {

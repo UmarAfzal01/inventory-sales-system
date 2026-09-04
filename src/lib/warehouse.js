@@ -176,7 +176,7 @@ async function withoutSecondaryIndexes(database, names, work) {
 }
 
 /**
- * The catalogue's category/subCategory for the given barcodes.
+ * The catalogue's category, sub-category and sale rate for the given barcodes.
  *
  * Read back after the upsert, so it reflects both products that already existed
  * and ones this sheet just introduced. Queried in chunks rather than one $in of
@@ -189,7 +189,7 @@ async function loadCatalogueCategories(database, barcodes) {
     const slice = barcodes.slice(i, i + 5000);
     const found = await database
       .collection(COL.PRODUCTS)
-      .find({ _id: { $in: slice } }, { projection: { category: 1, subCategory: 1 } })
+      .find({ _id: { $in: slice } }, { projection: { category: 1, subCategory: 1, saleRate: 1 } })
       .toArray();
     for (const p of found) out.set(p._id, p);
   }
@@ -225,6 +225,11 @@ async function commitSales({ database, rows, batchId, dates, catalogue }) {
           // unreliable one — see the catalogue-master note in commit().
           category: catalogue.get(r.barcode)?.category || r.product.category || UNCATEGORIZED,
           subCategory: catalogue.get(r.barcode)?.subCategory ?? (r.product.subCategory || ""),
+          // The sale rate at the moment this sheet was loaded, frozen onto the
+          // fact. It lives only in the INVENTORY sheet, so the catalogue is the
+          // only source; reading it live instead would silently rewrite every
+          // historical revenue figure the next time a price changed.
+          rate: catalogue.get(r.barcode)?.saleRate ?? r.product.saleRate ?? 0,
           batchId,
         });
     }
@@ -467,6 +472,7 @@ export async function rebuildDailyCube(database, dates) {
             sale: { $sum: "$qty" },
             pos: { $sum: { $cond: [{ $gt: ["$qty", 0] }, "$qty", 0] } },
             neg: { $sum: { $cond: [{ $lt: ["$qty", 0] }, "$qty", 0] } },
+            amount: { $sum: { $multiply: ["$qty", { $ifNull: ["$rate", 0] }] } },
             // A plain count, not $addToSet. sales_facts holds one row per
             // (date, branch, barcode), and the group key includes date and
             // branch — so each barcode contributes exactly one document and the
@@ -490,7 +496,7 @@ export async function rebuildDailyCube(database, dates) {
             category: "$_id.c",
             type: "$_id.t",
             sellingStatus: "$_id.s",
-            sale: 1, pos: 1, neg: 1,
+            sale: 1, pos: 1, neg: 1, amount: 1,
             productCount: 1,
             builtAt: { $literal: builtAt },
           },
@@ -804,6 +810,10 @@ export async function readProducts({
   pageSize = 50,
   metricFilter = null,
   scope = UNRESTRICTED,
+  // Revenue is admin-only, so it is not computed at all for anyone else rather
+  // than computed and then hidden — a field omitted from the response cannot
+  // leak through the API.
+  includeAmount = false,
 } = {}) {
   const database = db();
   // category / subCategory are optional. With neither, this is a global product
@@ -924,6 +934,9 @@ export async function readProducts({
             sale: { $sum: "$qty" },
             pos: { $sum: { $cond: [{ $gt: ["$qty", 0] }, "$qty", 0] } },
             neg: { $sum: { $cond: [{ $lt: ["$qty", 0] }, "$qty", 0] } },
+            ...(includeAmount
+              ? { amount: { $sum: { $multiply: ["$qty", { $ifNull: ["$rate", 0] }] } } }
+              : {}),
           },
         },
       ])
@@ -956,8 +969,8 @@ export async function readProducts({
   const slot = (barcode) => {
     if (!merged.has(barcode)) {
       merged.set(barcode, {
-        barcode, sale: 0, pos: 0, neg: 0, stock: 0,
-        branchStock: {}, branchSales: {},
+        barcode, sale: 0, pos: 0, neg: 0, amount: 0, stock: 0,
+        branchStock: {}, branchSales: {}, branchAmount: {},
       });
     }
     return merged.get(barcode);
@@ -973,6 +986,10 @@ export async function readProducts({
     t.sale += r.sale;
     t.pos += r.pos;
     t.neg += r.neg;
+    if (includeAmount) {
+      t.amount += r.amount ?? 0;
+      t.branchAmount[r._id.br] = r.amount ?? 0;
+    }
   }
   for (const r of stock) {
     const t = slot(r._id.b);
@@ -1026,6 +1043,7 @@ export async function readProducts({
         totalSales: a.totalSales + p.sale,
         positiveSales: a.positiveSales + p.pos,
         negativeSales: a.negativeSales + p.neg,
+        amount: a.amount + (p.amount ?? 0),
         totalInventory: a.totalInventory + p.stock,
         negativeStock:
           a.negativeStock + (Object.values(p.branchStock).some((q) => q < 0) ? 1 : 0),
@@ -1036,9 +1054,16 @@ export async function readProducts({
         zeroSales: a.zeroSales + (p.stock > 0 && p.sale === 0 ? 1 : 0),
       };
     },
-    { totalProducts: 0, totalSales: 0, positiveSales: 0, negativeSales: 0,
+    { totalProducts: 0, totalSales: 0, positiveSales: 0, negativeSales: 0, amount: 0,
       totalInventory: 0, negativeStock: 0, zeroStock: 0, zeroSales: 0 }
   );
+  if (!includeAmount) {
+    delete stats.amount;
+    for (const p of all) {
+      delete p.amount;
+      delete p.branchAmount;
+    }
+  }
 
   // Unknown, not zero — same reasoning as levels 1 and 2. Without this every
   // product looked out of stock whenever the range predated the snapshot.
@@ -1107,6 +1132,10 @@ export async function readDashboard({
   category = null,
   metricFilter = null,
   scope = UNRESTRICTED,
+  // Revenue is admin-only, so it is not computed at all for anyone else rather
+  // than computed and then hidden — a field omitted from the response cannot
+  // leak through the API.
+  includeAmount = false,
 } = {}) {
   const database = db();
 
@@ -1235,6 +1264,9 @@ export async function readDashboard({
                 totalSales: { $sum: "$qty" },
                 positiveSales: { $sum: { $cond: [{ $gt: ["$qty", 0] }, "$qty", 0] } },
                 negativeSales: { $sum: { $cond: [{ $lt: ["$qty", 0] }, "$qty", 0] } },
+                ...(includeAmount
+                  ? { amount: { $sum: { $multiply: ["$qty", { $ifNull: ["$rate", 0] }] } } }
+                  : {}),
               },
             },
           ])
@@ -1249,6 +1281,7 @@ export async function readDashboard({
                 totalSales: { $sum: "$sale" },
                 positiveSales: { $sum: "$pos" },
                 negativeSales: { $sum: "$neg" },
+                ...(includeAmount ? { amount: { $sum: { $ifNull: ["$amount", 0] } } } : {}),
               },
             },
           ])
@@ -1342,7 +1375,7 @@ export async function readDashboard({
     if (!merged.has(keyName)) {
       merged.set(keyName, {
         categoryName: keyName,
-        totalSales: 0, positiveSales: 0, negativeSales: 0,
+        totalSales: 0, positiveSales: 0, negativeSales: 0, amount: 0,
         totalInventory: 0, productCount: 0,
         negativeStockCount: 0, zeroStockCount: 0, zeroSalesCount: 0,
       });
@@ -1352,6 +1385,7 @@ export async function readDashboard({
 
   for (const s of sales) Object.assign(slot(s._id), {
     totalSales: s.totalSales, positiveSales: s.positiveSales, negativeSales: s.negativeSales,
+    ...(includeAmount ? { amount: s.amount ?? 0 } : {}),
   });
   for (const s of stock) {
     const t = slot(s._id);
@@ -1423,13 +1457,18 @@ export async function readDashboard({
       totalSales: a.totalSales + c.totalSales,
       positiveSales: a.positiveSales + c.positiveSales,
       negativeSales: a.negativeSales + c.negativeSales,
+      amount: a.amount + (c.amount ?? 0),
       negativeStock: a.negativeStock + (c.negativeStockCount ?? 0),
       zeroStock: a.zeroStock + (c.zeroStockCount ?? 0),
       zeroSales: a.zeroSales + (c.zeroSalesCount ?? 0),
     }),
     { totalProducts: 0, totalInventory: 0, totalSales: 0, positiveSales: 0,
-      negativeSales: 0, negativeStock: 0, zeroStock: 0, zeroSales: 0 }
+      negativeSales: 0, amount: 0, negativeStock: 0, zeroStock: 0, zeroSales: 0 }
   );
+  if (!includeAmount) {
+    delete stats.amount;
+    for (const c of allCategories) delete c.amount;
+  }
 
   // The headline cards get the same treatment, for the same reason.
   if (!stockDate) {

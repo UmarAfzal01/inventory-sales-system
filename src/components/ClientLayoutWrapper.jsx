@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname, useSearchParams, useRouter } from "next/navigation";
 import FileUpload from "@/components/FileUpload";
+import { formatAmount, exactAmount } from "@/lib/format";
 
 export default function ClientLayoutWrapper({ children }) {
   const router = useRouter();
@@ -39,6 +40,9 @@ export default function ClientLayoutWrapper({ children }) {
     };
   }, [router]);
   const isAdminUser = me?.role === "admin";
+  // On /sales the sidebar shows money per branch; the stock counts belong
+  // to the inventory view.
+  const isSalesView = (pathname || "").startsWith("/sales");
 
   // Changing branch must keep every other parameter — category, sub-category,
   // dates, type, status. Linking to a bare /dashboard?branch=X threw the user
@@ -77,6 +81,8 @@ export default function ClientLayoutWrapper({ children }) {
                   name: branchName,
                   negativeStock: branchRes.success && branchRes.stats ? branchRes.stats.negativeStock : 0,
                   zeroStock: branchRes.success && branchRes.stats ? branchRes.stats.zeroStock : 0,
+                  // Absent for non-admins, since the API never sends it.
+                  amount: branchRes.success && branchRes.stats ? branchRes.stats.amount : undefined,
                 };
               } catch {
                 return { name: branchName, negativeStock: 0, zeroStock: 0 };
@@ -168,13 +174,26 @@ export default function ClientLayoutWrapper({ children }) {
                     <span className={`w-2 h-2 rounded-full ${pathname === "/dashboard" && !currentBranch ? "bg-blue-600 shadow-[0_0_8px_rgba(37,99,235,0.8)]" : "bg-slate-400"}`}></span>
                     Inventory Overview
                   </Link>
+                  {isAdminUser && (
+                    <Link 
+                    href="/sales" 
+                    className={`flex items-center gap-2.5 px-3.5 py-2.5 rounded-2xl text-xs font-bold backdrop-blur-xl transition ${
+                      pathname === "/sales" && !currentBranch
+                        ? "bg-white/50 border border-white/70 text-blue-700 shadow-[0_8px_20px_rgba(37,99,235,0.1)]" 
+                        : "text-slate-600 hover:bg-white/20 hover:text-slate-900 border border-transparent"
+                    }`}
+                  >
+                    <span className={`w-2 h-2 rounded-full ${pathname === "/sales" && !currentBranch ? "bg-blue-600 shadow-[0_0_8px_rgba(37,99,235,0.8)]" : "bg-slate-400"}`}></span>
+                    Sales Overview
+                  </Link>
+                  )}
                 </div>
               </div>
 
               {/* Branch-wise Negative & Zero Stock List */}
               <div>
                 <div className="text-[11px] font-extrabold uppercase tracking-wider text-slate-400 px-3 mb-2">
-                  Branches Stock Breakdown
+                  {isSalesView ? "Branches Sales Breakdown" : "Branches Stock Breakdown"}
                 </div>
                 <div className="space-y-2 px-1">
                   <Link 
@@ -215,12 +234,23 @@ export default function ClientLayoutWrapper({ children }) {
                           </span>
                           
                           <div className="flex items-center gap-1.5 text-xs">
-                            <div className="bg-rose-500/10 backdrop-blur-md border border-rose-500/20 text-rose-700 px-2 py-1 rounded-xl font-black min-w-[28px] text-center shadow-xs">
-                              {branch.negativeStock.toLocaleString()}
-                            </div>
-                            <div className="bg-amber-500/10 backdrop-blur-md border border-amber-500/20 text-amber-700 px-2 py-1 rounded-xl font-black min-w-[28px] text-center shadow-xs">
-                              {branch.zeroStock.toLocaleString()}
-                            </div>
+                            {isSalesView ? (
+                              <div
+                                title={exactAmount(branch.amount)}
+                                className="bg-emerald-500/10 backdrop-blur-md border border-emerald-500/20 text-emerald-700 px-2 py-1 rounded-xl font-black text-center shadow-xs tabular-nums"
+                              >
+                                {formatAmount(branch.amount)}
+                              </div>
+                            ) : (
+                              <>
+                                <div className="bg-rose-500/10 backdrop-blur-md border border-rose-500/20 text-rose-700 px-2 py-1 rounded-xl font-black min-w-[28px] text-center shadow-xs">
+                                  {branch.negativeStock.toLocaleString()}
+                                </div>
+                                <div className="bg-amber-500/10 backdrop-blur-md border border-amber-500/20 text-amber-700 px-2 py-1 rounded-xl font-black min-w-[28px] text-center shadow-xs">
+                                  {branch.zeroStock.toLocaleString()}
+                                </div>
+                              </>
+                            )}
                           </div>
                         </Link>
                       );

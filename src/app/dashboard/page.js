@@ -1,9 +1,15 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
+import { formatAmount, exactAmount } from "@/lib/format";
 
 // Names the branch grid after whatever metric card is active, so a card
 // showing two of eleven branches says why.
+// Hidden on /sales, but a stock filter could still arrive in the URL and
+// silently empty the page with nothing on screen to explain it. At module scope
+// so it is not a fresh array on every render.
+const STOCK_METRICS = ["negativeStock", "zeroStock", "zeroSales"];
+
 const BRANCH_HEADING = {
   totalSales: "Branches with sales",
   positiveSales: "Branches with positive sales",
@@ -16,6 +22,10 @@ const BRANCH_HEADING = {
 export default function DashboardPage() {
   const router = useRouter();
   const pathname = usePathname();
+  // /sales renders this same component with the money metrics instead of the
+  // stock ones. Everything else — drill-down, filters, dates, scoping, search —
+  // is identical, so the two pages share one implementation.
+  const isSales = (pathname || "").startsWith("/sales");
   const searchParams = useSearchParams();
 
   const urlBranch = searchParams.get("branch");
@@ -199,7 +209,11 @@ export default function DashboardPage() {
           qp.set("page", String(productPage));
         }
 
-        if (activeMetricFilter) qp.set("metricFilter", activeMetricFilter);
+        // /sales has a single, non-clickable metric, so a filter arriving in the
+        // URL would narrow the page with no control on screen to undo it.
+        if (activeMetricFilter && !isSales) {
+          qp.set("metricFilter", activeMetricFilter);
+        }
 
         const res = await fetch(`/api/dashboard?${qp.toString()}`, {
           signal: controller.signal,
@@ -261,6 +275,7 @@ export default function DashboardPage() {
     productSearchDebounced,
     activeMetricFilter,
     reloadKey,
+      isSales,
   ]);
 
   // null means "not known" — no stock snapshot covers the selected range — and
@@ -407,14 +422,15 @@ export default function DashboardPage() {
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
           <div>
             <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 drop-shadow-sm">
-              Enterprise Analytics{" "}
+              {isSales ? "Sales Overview" : "Enterprise Analytics"}{" "}
               {selectedBranch !== "ALL" && (
                 <span className="text-blue-600">— {selectedBranch}</span>
               )}
             </h1>
             <p className="text-sm text-slate-500 font-medium mt-1">
-              Real-time multi-branch inventory tracking, sales performance, and
-              catalog overview.
+              {isSales
+                ? "Revenue by category, sub-category and product across every branch."
+                : "Real-time multi-branch inventory tracking, sales performance, and catalog overview."}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -862,7 +878,8 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          {dateFiltered &&
+          {!isSales &&
+            dateFiltered &&
             (stockAvailable ? (
               <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mt-3">
                 Sales reflect the selected dates. Stock as at {stockDate}.
@@ -875,7 +892,7 @@ export default function DashboardPage() {
             ))}
         </div>
 
-        {/* Sales & Stock Performance Section */}
+        {/* Sales & Stock Performance Section — stock omitted on /sales */}
         <div className="mb-10">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-extrabold tracking-tight text-slate-900 drop-shadow-sm">
@@ -892,6 +909,24 @@ export default function DashboardPage() {
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+            {/* Sales Amount — revenue, admin-only, so it is absent from the
+                response entirely for anyone else. */}
+            {isSales && (
+              <div className="backdrop-blur-3xl p-5 rounded-3xl border bg-gradient-to-br from-emerald-500/10 via-teal-500/5 to-white/40 border-emerald-500/20">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider text-emerald-700">
+                  Sales Amount
+                </h3>
+                <p
+                  title={exactAmount(stats.amount)}
+                  className="text-2xl font-black mt-2 tabular-nums leading-tight whitespace-nowrap text-emerald-700"
+                >
+                  {formatAmount(stats.amount)}
+                </p>
+              </div>
+            )}
+
+            {!isSales && (
+              <>
             {/* Net Sales Card */}
             <div
               onClick={() => handleMetricCardClick("totalSales")}
@@ -904,7 +939,7 @@ export default function DashboardPage() {
               <h3
                 className={`text-xs font-extrabold uppercase tracking-wider ${activeMetricFilter === "totalSales" ? "text-indigo-100" : "text-indigo-700"}`}
               >
-                Total Sales (Net)
+                {isSales ? "Units Sold (Net)" : "Total Sales (Net)"}
               </h3>
               <p
                 className={`${metricValueClass(stats.totalSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "totalSales" ? "text-white" : "text-slate-900"}`}
@@ -930,7 +965,7 @@ export default function DashboardPage() {
               <h3
                 className={`text-xs font-extrabold uppercase tracking-wider ${activeMetricFilter === "positiveSales" ? "text-teal-100" : "text-teal-700"}`}
               >
-                Positive Sales
+                {isSales ? "Units Sold" : "Positive Sales"}
               </h3>
               <p
                 className={`${metricValueClass(stats.positiveSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "positiveSales" ? "text-white" : "text-teal-700"}`}
@@ -956,7 +991,7 @@ export default function DashboardPage() {
               <h3
                 className={`text-xs font-extrabold uppercase tracking-wider ${activeMetricFilter === "negativeSales" ? "text-rose-100" : "text-rose-700"}`}
               >
-                Negative Sales
+                {isSales ? "Units Returned" : "Negative Sales"}
               </h3>
               <p
                 className={`${metricValueClass(stats.negativeSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "negativeSales" ? "text-white" : "text-rose-700"}`}
@@ -970,7 +1005,12 @@ export default function DashboardPage() {
               </div>
             </div>
 
-            {/* Zero Sales Card - dead stock: on the shelf, moving nothing. */}
+              </>
+            )}
+
+            {/* Zero Sales Card - dead stock: on the shelf, moving nothing.
+                Inventory-derived, so it is not part of the sales view. */}
+            {!isSales && (
             <div
               onClick={() => handleMetricCardClick("zeroSales")}
               className={`cursor-pointer backdrop-blur-3xl p-5 rounded-3xl border transition-all ${
@@ -995,7 +1035,10 @@ export default function DashboardPage() {
                 Click to filter categories
               </div>
             </div>
+            )}
 
+            {!isSales && (
+              <>
             {/* Negative Stock Card */}
             <div
               onClick={() => handleMetricCardClick("negativeStock")}
@@ -1047,6 +1090,8 @@ export default function DashboardPage() {
                 Click to filter categories
               </div>
             </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -1123,7 +1168,7 @@ export default function DashboardPage() {
               <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 border-b border-slate-200/70">
                 <p className="text-sm font-bold text-slate-700">
                   {productData.total.toLocaleString()} products
-                  {productData.stockDate && (
+                  {!isSales && productData.stockDate && (
                     <span className="font-medium text-slate-500">
                       {" "}
                       · stock as at {productData.stockDate}
@@ -1198,25 +1243,32 @@ export default function DashboardPage() {
                             </span>
                           )}
                           <span className="ml-auto text-xs font-extrabold text-slate-900 tabular-nums">
-                            {Math.round(p.sale).toLocaleString()}
+                            {isSales
+                              ? formatAmount(p.amount)
+                              : Math.round(p.sale).toLocaleString()}
                             <span className="text-[10px] font-bold text-slate-400">
                               {" "}
-                              units sold
+                              {isSales ? "amount" : "units sold"}
                             </span>
-                            <span className="text-slate-300"> · </span>
-                            {Math.round(p.stock).toLocaleString()}
-                            <span className="text-[10px] font-bold text-slate-400">
-                              {" "}
-                              stock
-                            </span>
+                            {!isSales && (
+                              <>
+                                <span className="text-slate-300"> · </span>
+                                {Math.round(p.stock).toLocaleString()}
+                                <span className="text-[10px] font-bold text-slate-400">
+                                  {" "}
+                                  stock
+                                </span>
+                              </>
+                            )}
                           </span>
                         </div>
 
                         <div className="mt-3 pt-3 border-t border-slate-100">
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
-                              {BRANCH_HEADING[activeMetricFilter] ??
-                                "Branch Quantities"}
+                              {isSales
+                                ? "Amount by branch"
+                                : (BRANCH_HEADING[activeMetricFilter] ?? "Branch Quantities")}
                             </span>
                             {/* Color-key legend so the two badges in each cell are self-explanatory
         without relying on the title="" tooltip. */}
@@ -1224,12 +1276,16 @@ export default function DashboardPage() {
                             <span className="flex items-center gap-2.5 text-[10px] font-bold">
                               <span className="flex items-center gap-1">
                                 <span className="w-2 h-2 rounded-full bg-indigo-500"></span>
-                                <span className="text-indigo-600">Sold</span>
+                                <span className="text-indigo-600">
+                                  {isSales ? "Amount" : "Sold"}
+                                </span>
                               </span>
-                              <span className="flex items-center gap-1">
-                                <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-                                <span className="text-emerald-600">Stock</span>
-                              </span>
+                              {!isSales && (
+                                <span className="flex items-center gap-1">
+                                  <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                                  <span className="text-emerald-600">Stock</span>
+                                </span>
+                              )}
                             </span>
                           </div>
 
@@ -1259,19 +1315,23 @@ export default function DashboardPage() {
                                           : "bg-slate-100 text-slate-400"
                                       }`}
                                     >
-                                      {Math.round(sold).toLocaleString()}
+                                      {isSales
+                                        ? formatAmount(p.branchAmount?.[b] ?? 0)
+                                        : Math.round(sold).toLocaleString()}
                                     </span>
-                                    <span
-                                      className={`px-1.5 py-0.5 rounded-md text-[11px] font-extrabold tabular-nums ${
-                                        qty < 0
-                                          ? "bg-rose-100 text-rose-700"
-                                          : qty === 0
-                                            ? "bg-slate-200 text-slate-500"
-                                            : "bg-emerald-50 text-emerald-700"
-                                      }`}
-                                    >
-                                      {Math.round(qty).toLocaleString()}
-                                    </span>
+                                    {!isSales && (
+                                      <span
+                                        className={`px-1.5 py-0.5 rounded-md text-[11px] font-extrabold tabular-nums ${
+                                          qty < 0
+                                            ? "bg-rose-100 text-rose-700"
+                                            : qty === 0
+                                              ? "bg-slate-200 text-slate-500"
+                                              : "bg-emerald-50 text-emerald-700"
+                                        }`}
+                                      >
+                                        {Math.round(qty).toLocaleString()}
+                                      </span>
+                                    )}
                                   </div>
                                 </div>
                               );
@@ -1327,12 +1387,29 @@ export default function DashboardPage() {
 
                     {/* Beautified Pill Metric Container matching Summary Card themes */}
                     <div className="space-y-2.5 bg-white/50 backdrop-blur-md p-4 rounded-2xl border border-white/80 shadow-[0_4px_15px_rgba(0,0,0,0.02)]">
+                      {isSales && cat.amount !== undefined && (
+                        <div className="flex items-center justify-between px-3.5 py-2.5 bg-gradient-to-r from-emerald-500/15 via-teal-500/10 to-emerald-500/5 border border-emerald-500/30 rounded-2xl transition-all shadow-[0_2px_8px_rgba(16,185,129,0.04)]">
+                          <span className="flex items-center gap-2 text-xs font-extrabold text-emerald-900 uppercase tracking-wide">
+                            <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 shadow-[0_0_8px_rgba(16,185,129,0.7)]"></span>
+                            Amount
+                          </span>
+                          <span
+                            title={exactAmount(cat.amount)}
+                            className="font-black text-emerald-950 text-sm tabular-nums"
+                          >
+                            {formatAmount(cat.amount)}
+                          </span>
+                        </div>
+                      )}
+
+                      {!isSales && (
+                        <>
                       {(!activeMetricFilter ||
                         activeMetricFilter === "totalSales") && (
                         <div className="flex items-center justify-between px-3.5 py-2.5 bg-gradient-to-r from-indigo-500/15 via-blue-500/10 to-indigo-500/5 border border-indigo-500/30 rounded-2xl transition-all shadow-[0_2px_8px_rgba(79,70,229,0.04)]">
                           <span className="flex items-center gap-2 text-xs font-extrabold text-indigo-900 uppercase tracking-wide">
                             <span className="w-2.5 h-2.5 rounded-full bg-indigo-600 shadow-[0_0_8px_rgba(79,70,229,0.7)]"></span>
-                            Net Sales
+                            {isSales ? "Units (Net)" : "Net Sales"}
                           </span>
                           <span className="font-black text-indigo-950 text-sm">
                             {cat.totalSales.toLocaleString()}
@@ -1366,6 +1443,11 @@ export default function DashboardPage() {
                         </div>
                       )}
 
+                        </>
+                      )}
+
+                      {!isSales && (
+                        <>
                       {(!activeMetricFilter ||
                         activeMetricFilter === "zeroSales") && (
                         <div className="flex items-center justify-between px-3.5 py-2.5 bg-gradient-to-r from-violet-500/15 via-purple-500/10 to-violet-500/5 border border-violet-500/30 rounded-2xl transition-all shadow-[0_2px_8px_rgba(124,58,237,0.04)]">
@@ -1405,6 +1487,8 @@ export default function DashboardPage() {
                         </div>
                       )}
 
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>

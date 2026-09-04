@@ -33,9 +33,10 @@ export async function middleware(req) {
     return NextResponse.redirect(login);
   }
 
-  // User management is admin-only. A viewer who types the URL lands on the
-  // dashboard instead of a page whose every request would 403.
-  if (pathname.startsWith("/users") && !isAdmin(session)) {
+  // User management and the sales overview are admin-only. A viewer who types
+  // either URL lands on the dashboard instead of a page whose every request
+  // would 403.
+  if ((pathname.startsWith("/users") || pathname.startsWith("/sales")) && !isAdmin(session)) {
     return NextResponse.redirect(new URL("/dashboard", req.url));
   }
 
@@ -43,5 +44,5 @@ export async function middleware(req) {
 }
 
 export const config = {
-  matcher: ["/", "/login", "/dashboard/:path*", "/users/:path*"],
+  matcher: ["/", "/login", "/dashboard/:path*", "/users/:path*", "/sales/:path*"],
 };
