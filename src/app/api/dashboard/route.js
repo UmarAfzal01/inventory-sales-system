@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
-import { ensureSchema } from "@/lib/schema";
 import { parseIsoDate } from "@/lib/ingest";
 import { readDashboard, readProducts } from "@/lib/warehouse";
 import { requireUser } from "@/lib/guard";
@@ -27,7 +26,11 @@ export async function GET(req) {
     const includeAmount = user.role === "admin";
 
     await dbConnect();
-    await ensureSchema(mongoose.connection.db);
+    // ensureSchema deliberately NOT called here. It is a write-path concern —
+    // creating collections, updating validators, building indexes — and the
+    // upload route runs it. On a long-lived server the memoised version cost
+    // nothing after the first request, but each serverless instance is a new
+    // process: 23 round trips at ~800ms each, ~19s, on every cold start.
 
     const q = req.nextUrl.searchParams;
 

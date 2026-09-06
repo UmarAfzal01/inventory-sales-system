@@ -151,7 +151,7 @@ export async function commit({ rows, fileType, batchId, dates }) {
  * dropping one, even briefly, would let a concurrent upload past the batch
  * lock, and they are tiny anyway.
  */
-async function withoutSecondaryIndexes(database, names, work) {
+export async function dropSecondaryIndexes(database, names) {
   const dropped = [];
   for (const name of names) {
     const indexes = await database.collection(name).indexes().catch(() => []);
@@ -161,19 +161,41 @@ async function withoutSecondaryIndexes(database, names, work) {
       dropped.push({ name, key: index.key, indexName: index.name });
     }
   }
+  return dropped;
+}
+
+/**
+ * Puts back what dropSecondaryIndexes removed.
+ *
+ * The specs are stored on the batch document rather than held in memory,
+ * because a chunked upload spans many requests — and on a serverless host,
+ * many processes. Nothing in memory survives between them.
+ */
+export async function restoreSecondaryIndexes(database, dropped) {
+  for (const d of dropped ?? []) {
+    await database
+      .collection(d.name)
+      .createIndex(d.key, { name: d.indexName })
+      .catch(() => {});
+  }
+}
+
+async function withoutSecondaryIndexes(database, names, work) {
+  const dropped = await dropSecondaryIndexes(database, names);
   try {
     return await work();
   } finally {
     // Rebuilt even if the load threw: a half-written collection with its
     // indexes missing would leave every dashboard query on a collection scan.
-    for (const d of dropped) {
-      await database
-        .collection(d.name)
-        .createIndex(d.key, { name: d.indexName })
-        .catch(() => {});
-    }
+    await restoreSecondaryIndexes(database, dropped);
   }
 }
+
+/** Which collections a load of this type rewrites. */
+export const TARGET_COLLECTIONS = {
+  sale: [COL.SALES_FACTS, COL.DAILY_CUBE],
+  inventory: [COL.INVENTORY_STATE, COL.STOCK_CUBE],
+};
 
 /**
  * The catalogue's category, sub-category and sale rate for the given barcodes.
@@ -1502,4 +1524,232 @@ export async function readDashboard({
       maxDate: meta?.maxDate ?? null,
     },
   };
+}
+
+/* ---------------------------------------------------------------------------
+ * Chunked upload
+ *
+ * The single-request path above holds the whole sheet in memory, which a 4.5MB
+ * request-body limit makes impossible for a 20MB workbook. Here the browser
+ * parses and de-duplicates the sheet, then streams it in ~2,500-row batches.
+ *
+ * That splits one function into three phases, because several steps need the
+ * whole dataset and cannot run per batch:
+ *
+ *   begin   drops indexes, clears the day being replaced, claims the lock
+ *   chunk   writes rows; safe to retry, since every write is keyed on a
+ *           natural id and the browser guarantees a key appears in one batch
+ *   finish  rebuilds the cubes, derives zero-stock, puts the indexes back
+ *
+ * State that used to live in a local variable now lives on the batch document,
+ * because nothing in memory survives between serverless invocations.
+ * ------------------------------------------------------------------------- */
+
+/** Phase 1: clear what this load replaces and take the indexes down. */
+export async function beginBatch({ database, fileType, dates, isNewer }) {
+  const dropped = await dropSecondaryIndexes(database, TARGET_COLLECTIONS[fileType] ?? []);
+
+  if (fileType === "sale") {
+    // Once, here — not per batch, or each batch would delete the rows the
+    // previous one just wrote.
+    await database.collection(COL.SALES_FACTS).deleteMany({ date: { $in: dates } });
+  } else {
+    const date = dates[0];
+    await database.collection(COL.STOCK_CUBE).deleteMany({ date });
+    if (isNewer) {
+      // The whole current position goes, because a snapshot replaces it
+      // wholesale; branch-by-branch deletes would leave stale rows for any
+      // branch missing from this sheet.
+      await database.collection(COL.INVENTORY_STATE).deleteMany({});
+    }
+  }
+  return dropped;
+}
+
+/** Phase 2: one batch of parsed rows. Idempotent. */
+export async function writeChunk({ database, rows, fileType, batchId, dates, isNewer, branchColumns }) {
+  const products = new Map();
+  const lastSold = new Map();
+  for (const r of rows) {
+    products.set(r.barcode, {
+      ...r.product,
+      ...(fileType === "inventory" && isNewer
+        ? { stockAsOf: r.date, inStock: r.cells.some((c) => c.qty > 0) }
+        : {}),
+    });
+    if (fileType === "sale" && r.cells.length) {
+      const prev = lastSold.get(r.barcode);
+      if (!prev || r.date > prev) lastSold.set(r.barcode, r.date);
+    }
+  }
+  await chunk([...products.entries()], 1000, (batch) =>
+    database.collection(COL.PRODUCTS).bulkWrite(
+      batch.map(([barcode, p]) => ({
+        updateOne: {
+          filter: { _id: barcode },
+          update: {
+            ...(fileType === "inventory" ? { $set: p } : { $setOnInsert: p }),
+            ...(lastSold.has(barcode) ? { $max: { lastSoldAt: lastSold.get(barcode) } } : {}),
+          },
+          upsert: true,
+        },
+      })),
+      { ordered: false }
+    )
+  );
+
+  if (fileType === "sale") {
+    const catalogue = await loadCatalogueCategories(database, [...products.keys()]);
+    const facts = [];
+    for (const r of rows) {
+      for (const c of r.cells) {
+        facts.push({
+          _id: `${dateSlug(r.date)}|${c.branch}|${r.barcode}`,
+          date: r.date,
+          branch: c.branch,
+          barcode: r.barcode,
+          qty: c.qty,
+          category: catalogue.get(r.barcode)?.category || r.product.category || UNCATEGORIZED,
+          subCategory: catalogue.get(r.barcode)?.subCategory ?? (r.product.subCategory || ""),
+          rate: catalogue.get(r.barcode)?.saleRate ?? r.product.saleRate ?? 0,
+          batchId,
+        });
+      }
+    }
+    // replaceOne, not insertMany: a retried batch must not collide, and must
+    // not double the quantity the way $inc would.
+    await chunk(facts, 1000, (batch) =>
+      database.collection(COL.SALES_FACTS).bulkWrite(
+        batch.map((f) => ({ replaceOne: { filter: { _id: f._id }, replacement: f, upsert: true } })),
+        { ordered: false }
+      )
+    );
+    return { rows: rows.length, written: facts.length };
+  }
+
+  return writeInventoryChunk({ database, rows, batchId, dates, isNewer, branchColumns });
+}
+
+/**
+ * One batch of inventory rows.
+ *
+ * The stock cube used to be built in one pass over the whole sheet. Here it is
+ * accumulated with $inc instead, which is exact because every input is additive
+ * per product AND the browser guarantees each barcode appears in exactly one
+ * batch — two batches sharing a barcode would count it twice.
+ *
+ * zeroStockCount is the one figure that is not additive at branch level
+ * (`productCount - nonZero`), so it is derived in finishBatch once the totals
+ * are final. The ALL row's version IS additive, because it is decided per
+ * product: stocked at fewer than every branch, or not.
+ */
+async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, branchColumns }) {
+  const asOf = dates[0];
+  const day = dateSlug(asOf);
+  const branches = branchColumns?.length ? branchColumns : BRANCH_CODES;
+
+  const coverage = new Map();
+  const stateDocs = [];
+  const cube = new Map();
+  const bump = (id, base, field, by) => {
+    let hit = cube.get(id);
+    if (!hit) { hit = { base, inc: {} }; cube.set(id, hit); }
+    hit.inc[field] = (hit.inc[field] ?? 0) + by;
+  };
+
+  for (const r of rows) {
+    const category = r.product.category || UNCATEGORIZED;
+    const subCategory = r.product.subCategory || "";
+    const type = r.product.type || "";
+    const status = r.product.sellingStatus || "";
+
+    let nonZeroBranches = 0;
+    let productTotal = 0;
+    let productNegative = false;
+
+    for (const branch of branches) {
+      const cell = r.cells.find((c) => c.branch === branch);
+      const qty = cell?.qty ?? 0;
+      const id = `${day}|${branch}|${category}|${type}|${status}`;
+      const base = { date: asOf, branch, category, type, sellingStatus: status };
+      // Every covered product counts toward every branch's row, whether or not
+      // it has stock there — that is what makes zero-stock derivable.
+      bump(id, base, "productCount", 1);
+      if (qty !== 0) {
+        bump(id, base, "nonZero", 1);
+        bump(id, base, "totalQty", qty);
+        if (qty < 0) bump(id, base, "negativeStockCount", 1);
+        nonZeroBranches += 1;
+        productTotal += qty;
+        if (qty < 0) productNegative = true;
+        stateDocs.push({
+          _id: `${branch}|${r.barcode}`,
+          branch, barcode: r.barcode, qty, category, subCategory, asOf, batchId,
+        });
+      }
+      coverage.set(branch, (coverage.get(branch) ?? 0) + 1);
+    }
+
+    const allId = `${day}|${ALL}|${category}|${type}|${status}`;
+    const allBase = { date: asOf, branch: ALL, category, type, sellingStatus: status };
+    bump(allId, allBase, "productCount", 1);
+    bump(allId, allBase, "totalQty", productTotal);
+    if (productNegative) bump(allId, allBase, "negativeStockCount", 1);
+    // Out of stock somewhere counts once for the product, not once per branch.
+    if (nonZeroBranches < branches.length) bump(allId, allBase, "zeroStockCount", 1);
+  }
+
+  await database.collection(COL.COVERAGE).bulkWrite(
+    [...coverage.entries()].map(([branch, n]) => ({
+      updateOne: {
+        filter: { _id: `${day}|${branch}` },
+        update: { $set: { date: asOf, branch, batchId }, $inc: { productCount: n } },
+        upsert: true,
+      },
+    })),
+    { ordered: false }
+  );
+
+  await chunk([...cube.entries()], 500, (batch) =>
+    database.collection(COL.STOCK_CUBE).bulkWrite(
+      batch.map(([_id, { base, inc }]) => ({
+        updateOne: { filter: { _id }, update: { $setOnInsert: base, $inc: inc }, upsert: true },
+      })),
+      { ordered: false }
+    )
+  );
+
+  if (!isNewer) return { rows: rows.length, written: 0 };
+
+  await chunk(stateDocs, 1000, (batch) =>
+    database.collection(COL.INVENTORY_STATE).bulkWrite(
+      batch.map((d) => ({ replaceOne: { filter: { _id: d._id }, replacement: d, upsert: true } })),
+      { ordered: false }
+    )
+  );
+  return { rows: rows.length, written: stateDocs.length };
+}
+
+/** Phase 3: finish the aggregates and put the indexes back. */
+export async function finishBatch({ database, fileType, dates, dropped }) {
+  if (fileType === "sale") {
+    await rebuildDailyCube(database, dates);
+  } else {
+    // Branch-level zero stock is productCount - nonZero, which only holds once
+    // every batch has landed. The ALL rows already carry their own figure.
+    await database.collection(COL.STOCK_CUBE).updateMany(
+      { date: dates[0], branch: { $ne: ALL } },
+      [
+        {
+          $set: {
+            zeroStockCount: {
+              $max: [0, { $subtract: ["$productCount", { $ifNull: ["$nonZero", 0] }] }],
+            },
+          },
+        },
+      ]
+    );
+  }
+  await restoreSecondaryIndexes(database, dropped);
+  await rebuildMeta();
 }

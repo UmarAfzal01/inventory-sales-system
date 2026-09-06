@@ -1,11 +1,60 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import {
+  readWorkbook,
+  fingerprint,
+  dedupeRows,
+  datesInRows,
+  detectBranchColumns,
+  CHUNK_ROWS,
+} from "@/lib/sheet-client";
+import { ALL_META_HEADERS } from "@/lib/schema";
+
+/**
+ * Reads an API response that is expected to be JSON but may not be.
+ *
+ * A platform can reject a request before it ever reaches the route — Vercel
+ * returns an HTML page for a body over its 4.5MB limit — and calling
+ * res.json() on that produced "Unexpected token 'R'", which tells the operator
+ * nothing about the actual problem. The status is translated instead.
+ */
+async function readJsonResponse(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (res.status === 413) {
+      return {
+        success: false,
+        error:
+          "The server rejected this file as too large. Files over about 4.5MB " +
+          "cannot be uploaded to this deployment — the limit is imposed by the " +
+          "hosting platform before the request reaches the application.",
+      };
+    }
+    if (res.status === 504 || res.status === 502) {
+      return {
+        success: false,
+        error:
+          "The upload timed out on the server. Large sheets take longer than " +
+          "this deployment allows for a single request.",
+      };
+    }
+    return {
+      success: false,
+      error: `The server returned an unexpected response (HTTP ${res.status}).`,
+    };
+  }
+}
 
 export default function FileUpload({ isOpen, onClose }) {
   const [file, setFile] = useState(null);
   const [fileType, setFileType] = useState("sale");
   const [previewData, setPreviewData] = useState(null);
+  // Parsed in the browser: the 20MB file never leaves it. What the server
+  // sees is metadata, then small batches of rows.
+  const [parsed, setParsed] = useState(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState("");
@@ -89,71 +138,132 @@ export default function FileUpload({ isOpen, onClose }) {
   const handlePreview = async (e) => {
     e.preventDefault();
     if (!file) return alert("Please select a file first.");
+    if (fileType === "inventory" && !snapshotDate) {
+      return setErrors(["Pick a snapshot date for this inventory sheet."]);
+    }
 
     setLoading(true);
     setMessage("");
     setErrors([]);
     setPreviewData(null);
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("fileType", fileType);
-    formData.append("action", "preview");
-    if (fileType === "inventory") formData.append("snapshotDate", snapshotDate);
+    setParsed(null);
 
     try {
-      const res = await fetch("/api/upload", {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
+      const { headers, rows } = await readWorkbook(file);
+      const branchColumns = detectBranchColumns(headers, ALL_META_HEADERS);
+      const deduped = dedupeRows(rows, fileType, branchColumns);
+      const dates = datesInRows(deduped, fileType, snapshotDate);
 
-      if (data.success) {
-        setProgress(100);
-        setPreviewData(data.summary);
-      } else {
-        // Header validation returns a list; everything else a single message.
-        setErrors(data.errors?.length ? data.errors : [data.error || "Could not read this file."]);
+      if (!dates.length) {
+        setErrors([
+          fileType === "inventory"
+            ? "Pick a snapshot date for this inventory sheet."
+            : "No usable MONTH/DAY values were found in this sheet.",
+        ]);
+        return;
       }
+
+      const hash = await fingerprint(file);
+      setParsed({ headers, rows: deduped, branchColumns, dates, hash });
+      setPreviewData({
+        fileType,
+        totalRows: rows.length,
+        usableRows: deduped.length,
+        branchColumns,
+        dates,
+        chunks: Math.ceil(deduped.length / CHUNK_ROWS),
+        duplicatesMerged: rows.length - deduped.length,
+      });
+      setProgress(0);
     } catch (err) {
-      setErrors([`Network error: ${err.message}`]);
+      setErrors([err.message || "Could not read this file."]);
     } finally {
       setLoading(false);
     }
   };
 
   const handleConfirmUpload = async () => {
+    if (!parsed) return;
     setLoading(true);
     setMessage("");
     setErrors([]);
+    setProgress(0);
 
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("fileType", fileType);
-    formData.append("action", "upload");
-    if (fileType === "inventory") formData.append("snapshotDate", snapshotDate);
-
+    let batchId = null;
     try {
-      const res = await fetch("/api/upload", {
+      const begun = await fetch("/api/upload/begin", {
         method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileType,
+          fileName: file.name,
+          fileSize: file.size,
+          fileHash: parsed.hash,
+          headers: parsed.headers,
+          dates: parsed.dates,
+          totalRows: parsed.rows.length,
+        }),
+      }).then(readJsonResponse);
 
-      if (data.success) {
-        setProgress(100);
-        setMessage(data.message);
-        setPreviewData(null);
-        setFile(null);
-        // The dashboard fetches its own data on the client, so nothing would
-        // otherwise tell it new figures exist — you had to reload the page.
-        // It listens for this and refetches in place.
-        window.dispatchEvent(new CustomEvent("inventory:data-updated"));
-      } else {
-        setErrors(data.errors?.length ? data.errors : [data.error || "Upload failed."]);
+      if (!begun.success) {
+        setErrors(
+          begun.errors?.length ? begun.errors : [begun.error || "Could not start the upload."]
+        );
+        return;
       }
+      batchId = begun.batchId;
+
+      const total = parsed.rows.length;
+      for (let i = 0, seq = 0; i < total; i += CHUNK_ROWS, seq += 1) {
+        const slice = parsed.rows.slice(i, i + CHUNK_ROWS);
+        setMessage(
+          `Uploading ${Math.min(i + slice.length, total).toLocaleString()} of ${total.toLocaleString()} rows...`
+        );
+
+        // One retry per batch: a single dropped request should not cost the
+        // whole upload. Re-sending is safe because every write is keyed on a
+        // natural id.
+        let sent = null;
+        for (let attempt = 0; attempt < 2 && !sent?.success; attempt += 1) {
+          sent = await fetch("/api/upload/chunk", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ batchId, seq, rows: slice }),
+          }).then(readJsonResponse);
+        }
+        if (!sent.success) {
+          throw new Error(sent.error || `Failed while sending rows ${i + 1}-${i + slice.length}.`);
+        }
+
+        setProgress(Math.round(((i + slice.length) / total) * 100));
+      }
+
+      setMessage("Building summaries...");
+      const done = await fetch("/api/upload/commit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batchId }),
+      }).then(readJsonResponse);
+      if (!done.success) throw new Error(done.error || "Could not finish the upload.");
+
+      batchId = null;
+      setProgress(100);
+      setMessage(done.message);
+      setPreviewData(null);
+      setParsed(null);
+      setFile(null);
+      window.dispatchEvent(new CustomEvent("inventory:data-updated"));
     } catch (err) {
-      setErrors([`Network error: ${err.message}`]);
+      setErrors([err.message || "The upload failed."]);
+      // Releases the lock and puts the indexes back. Without this a failed
+      // upload would block every later one until the stale timeout expired.
+      if (batchId) {
+        await fetch("/api/upload/abort", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ batchId, reason: err.message }),
+        }).catch(() => {});
+      }
     } finally {
       setLoading(false);
     }
