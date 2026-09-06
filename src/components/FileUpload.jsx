@@ -135,6 +135,40 @@ export default function FileUpload({ isOpen, onClose }) {
     }
   };
 
+  /**
+   * Reads and de-duplicates the workbook in the browser.
+   *
+   * Shared by both entry points: the sales flow previews first, while the
+   * inventory flow uploads in one click. Inventory used to post the file
+   * straight to the server, so with chunking it has to parse here too — without
+   * that, the button called an upload that returned immediately because nothing
+   * had been parsed, and nothing happened at all.
+   */
+  const parseSelectedFile = async () => {
+    const { headers, rows } = await readWorkbook(file);
+    const branchColumns = detectBranchColumns(headers, ALL_META_HEADERS);
+    const deduped = dedupeRows(rows, fileType, branchColumns);
+    const dates = datesInRows(deduped, fileType, snapshotDate);
+    if (!dates.length) {
+      throw new Error(
+        fileType === "inventory"
+          ? "Pick a snapshot date for this inventory sheet."
+          : "No usable MONTH/DAY values were found in this sheet."
+      );
+    }
+    const hash = await fingerprint(file);
+    const summary = {
+      fileType,
+      totalRows: rows.length,
+      usableRows: deduped.length,
+      branchColumns,
+      dates,
+      chunks: Math.ceil(deduped.length / CHUNK_ROWS),
+      duplicatesMerged: rows.length - deduped.length,
+    };
+    return { parsed: { headers, rows: deduped, branchColumns, dates, hash }, summary };
+  };
+
   const handlePreview = async (e) => {
     e.preventDefault();
     if (!file) return alert("Please select a file first.");
@@ -149,31 +183,9 @@ export default function FileUpload({ isOpen, onClose }) {
     setParsed(null);
 
     try {
-      const { headers, rows } = await readWorkbook(file);
-      const branchColumns = detectBranchColumns(headers, ALL_META_HEADERS);
-      const deduped = dedupeRows(rows, fileType, branchColumns);
-      const dates = datesInRows(deduped, fileType, snapshotDate);
-
-      if (!dates.length) {
-        setErrors([
-          fileType === "inventory"
-            ? "Pick a snapshot date for this inventory sheet."
-            : "No usable MONTH/DAY values were found in this sheet.",
-        ]);
-        return;
-      }
-
-      const hash = await fingerprint(file);
-      setParsed({ headers, rows: deduped, branchColumns, dates, hash });
-      setPreviewData({
-        fileType,
-        totalRows: rows.length,
-        usableRows: deduped.length,
-        branchColumns,
-        dates,
-        chunks: Math.ceil(deduped.length / CHUNK_ROWS),
-        duplicatesMerged: rows.length - deduped.length,
-      });
+      const { parsed: next, summary } = await parseSelectedFile();
+      setParsed(next);
+      setPreviewData(summary);
       setProgress(0);
     } catch (err) {
       setErrors([err.message || "Could not read this file."]);
@@ -183,7 +195,11 @@ export default function FileUpload({ isOpen, onClose }) {
   };
 
   const handleConfirmUpload = async () => {
-    if (!parsed) return;
+    if (!file) return alert("Please select a file first.");
+    if (fileType === "inventory" && !snapshotDate) {
+      return setErrors(["Pick a snapshot date for this inventory sheet."]);
+    }
+
     setLoading(true);
     setMessage("");
     setErrors([]);
@@ -191,6 +207,15 @@ export default function FileUpload({ isOpen, onClose }) {
 
     let batchId = null;
     try {
+      // The sales flow has already parsed via the preview; the inventory flow
+      // arrives here directly, so it parses now.
+      let ready = parsed;
+      if (!ready) {
+        setMessage("Reading the sheet...");
+        const out = await parseSelectedFile();
+        ready = out.parsed;
+        setParsed(ready);
+      }
       const begun = await fetch("/api/upload/begin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -198,10 +223,10 @@ export default function FileUpload({ isOpen, onClose }) {
           fileType,
           fileName: file.name,
           fileSize: file.size,
-          fileHash: parsed.hash,
-          headers: parsed.headers,
-          dates: parsed.dates,
-          totalRows: parsed.rows.length,
+          fileHash: ready.hash,
+          headers: ready.headers,
+          dates: ready.dates,
+          totalRows: ready.rows.length,
         }),
       }).then(readJsonResponse);
 
@@ -213,9 +238,9 @@ export default function FileUpload({ isOpen, onClose }) {
       }
       batchId = begun.batchId;
 
-      const total = parsed.rows.length;
+      const total = ready.rows.length;
       for (let i = 0, seq = 0; i < total; i += CHUNK_ROWS, seq += 1) {
-        const slice = parsed.rows.slice(i, i + CHUNK_ROWS);
+        const slice = ready.rows.slice(i, i + CHUNK_ROWS);
         setMessage(
           `Uploading ${Math.min(i + slice.length, total).toLocaleString()} of ${total.toLocaleString()} rows...`
         );
