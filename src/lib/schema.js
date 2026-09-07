@@ -34,6 +34,19 @@ export const COL = {
 };
 
 /**
+ * Where a chunked upload writes before it is trusted.
+ *
+ * Nothing an upload sends touches the live collections until it commits. A
+ * failure then costs only the staging collection, which is dropped — the
+ * previous data was never modified, so there is nothing to roll back.
+ */
+export const STAGE = {
+  [COL.INVENTORY_STATE]: "stage_inventory_state",
+  [COL.SALES_FACTS]: "stage_sales_facts",
+  [COL.STOCK_CUBE]: "stage_stock_cube",
+};
+
+/**
  * Every branch that may appear as a spreadsheet column.
  *
  * CW appears in inventory sheets but never in sales sheets — it is a warehouse,

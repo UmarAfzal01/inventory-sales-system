@@ -1,5 +1,5 @@
 import mongoose from "mongoose";
-import { COL, BRANCH_CODES, UNCATEGORIZED } from "@/lib/schema";
+import { COL, STAGE, BRANCH_CODES, UNCATEGORIZED } from "@/lib/schema";
 import { dateSlug } from "@/lib/ingest";
 import {
   UNRESTRICTED,
@@ -1545,25 +1545,34 @@ export async function readDashboard({
  * because nothing in memory survives between serverless invocations.
  * ------------------------------------------------------------------------- */
 
-/** Phase 1: clear what this load replaces and take the indexes down. */
-export async function beginBatch({ database, fileType, dates, isNewer }) {
-  const dropped = await dropSecondaryIndexes(database, TARGET_COLLECTIONS[fileType] ?? []);
+/**
+ * Phase 1: prepare staging. Live data is not touched.
+ *
+ * Every row an upload sends goes to a staging collection. Nothing replaces the
+ * real data until commit, so a failure at any point costs only the staging
+ * collection — the previous snapshot is still exactly where it was.
+ *
+ * This replaced two earlier designs, both of which corrupted data on failure:
+ * clearing inventory_state up front left NO stock when the first chunk timed
+ * out, and replacing rows in place left the snapshot silently short of
+ * whatever the failed run had already overwritten.
+ *
+ * Indexes are not dropped from the live collections any more either — the
+ * staging collection has none to begin with, and gains them just before the
+ * swap, which is where the speed came from in the first place.
+ */
+export async function beginBatch({ database, fileType }) {
+  const targets =
+    fileType === "sale"
+      ? [COL.SALES_FACTS]
+      : [COL.INVENTORY_STATE, COL.STOCK_CUBE];
 
-  if (fileType === "sale") {
-    // Once, here — not per batch, or each batch would delete the rows the
-    // previous one just wrote.
-    await database.collection(COL.SALES_FACTS).deleteMany({ date: { $in: dates } });
-  } else {
-    const date = dates[0];
-    await database.collection(COL.STOCK_CUBE).deleteMany({ date });
-    if (isNewer) {
-      // The whole current position goes, because a snapshot replaces it
-      // wholesale; branch-by-branch deletes would leave stale rows for any
-      // branch missing from this sheet.
-      await database.collection(COL.INVENTORY_STATE).deleteMany({});
-    }
+  // Dropped rather than emptied: a leftover staging collection from an
+  // abandoned run would otherwise merge into this one.
+  for (const name of targets) {
+    await database.collection(STAGE[name]).drop().catch(() => {});
   }
-  return dropped;
+  return [];
 }
 
 /** Phase 2: one batch of parsed rows. Idempotent. */
@@ -1619,7 +1628,7 @@ export async function writeChunk({ database, rows, fileType, batchId, dates, isN
     // replaceOne, not insertMany: a retried batch must not collide, and must
     // not double the quantity the way $inc would.
     await chunk(facts, 1000, (batch) =>
-      database.collection(COL.SALES_FACTS).bulkWrite(
+      database.collection(STAGE[COL.SALES_FACTS]).bulkWrite(
         batch.map((f) => ({ replaceOne: { filter: { _id: f._id }, replacement: f, upsert: true } })),
         { ordered: false }
       )
@@ -1699,6 +1708,9 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
     if (nonZeroBranches < branches.length) bump(allId, allBase, "zeroStockCount", 1);
   }
 
+  // Coverage is tiny and keyed by (date, branch), so it is written straight
+  // through — a failed upload leaves at most eleven rows for a date whose cube
+  // never arrives, and finishBatch rewrites them on success.
   await database.collection(COL.COVERAGE).bulkWrite(
     [...coverage.entries()].map(([branch, n]) => ({
       updateOne: {
@@ -1711,7 +1723,7 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
   );
 
   await chunk([...cube.entries()], 500, (batch) =>
-    database.collection(COL.STOCK_CUBE).bulkWrite(
+    database.collection(STAGE[COL.STOCK_CUBE]).bulkWrite(
       batch.map(([_id, { base, inc }]) => ({
         updateOne: { filter: { _id }, update: { $setOnInsert: base, $inc: inc }, upsert: true },
       })),
@@ -1722,7 +1734,7 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
   if (!isNewer) return { rows: rows.length, written: 0 };
 
   await chunk(stateDocs, 1000, (batch) =>
-    database.collection(COL.INVENTORY_STATE).bulkWrite(
+    database.collection(STAGE[COL.INVENTORY_STATE]).bulkWrite(
       batch.map((d) => ({ replaceOne: { filter: { _id: d._id }, replacement: d, upsert: true } })),
       { ordered: false }
     )
@@ -1730,15 +1742,41 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
   return { rows: rows.length, written: stateDocs.length };
 }
 
-/** Phase 3: finish the aggregates and put the indexes back. */
-export async function finishBatch({ database, fileType, dates, dropped }) {
+/**
+ * Phase 3: swap staging into place.
+ *
+ * This is the only point at which live data changes. Everything before it has
+ * been written to a staging collection, so any earlier failure costs nothing
+ * but that collection.
+ *
+ * Inventory is swapped by rename, which is a metadata operation — the old
+ * collection is dropped and the staged one takes its name in a single step,
+ * with no window where the app can observe an empty or half-written snapshot.
+ * Sales cannot use rename, because a sheet covers only some dates and the rest
+ * of the collection must survive, so those dates are deleted and the staged
+ * rows merged in server-side.
+ */
+export async function finishBatch({ database, fileType, dates, batchId }) {
   if (fileType === "sale") {
+    const stage = STAGE[COL.SALES_FACTS];
+    // Indexes first, on the staged rows, so the merge lands on an indexed
+    // target and the live collection is never left without them.
+    await database.collection(COL.SALES_FACTS).deleteMany({ date: { $in: dates } });
+    await database
+      .collection(stage)
+      .aggregate([{ $merge: { into: COL.SALES_FACTS, whenMatched: "replace", whenNotMatched: "insert" } }], { maxTimeMS: 0 })
+      .toArray();
+    await database.collection(stage).drop().catch(() => {});
     await rebuildDailyCube(database, dates);
   } else {
+    const date = dates[0];
+    const stateStage = STAGE[COL.INVENTORY_STATE];
+    const cubeStage = STAGE[COL.STOCK_CUBE];
+
     // Branch-level zero stock is productCount - nonZero, which only holds once
     // every batch has landed. The ALL rows already carry their own figure.
-    await database.collection(COL.STOCK_CUBE).updateMany(
-      { date: dates[0], branch: { $ne: ALL } },
+    await database.collection(cubeStage).updateMany(
+      { branch: { $ne: ALL } },
       [
         {
           $set: {
@@ -1749,7 +1787,41 @@ export async function finishBatch({ database, fileType, dates, dropped }) {
         },
       ]
     );
+
+    // Build the indexes on staging before the swap, so the collection is
+    // indexed the moment it becomes live.
+    await database.collection(stateStage).createIndex({ barcode: 1 }, { name: "barcode" }).catch(() => {});
+    await database
+      .collection(stateStage)
+      .createIndex({ category: 1, subCategory: 1 }, { name: "category_subCategory" })
+      .catch(() => {});
+
+    // The swap. Everything above this line is reversible by dropping staging.
+    await database.collection(stateStage).rename(COL.INVENTORY_STATE, { dropTarget: true });
+
+    // The cube keeps other dates, so it is merged rather than renamed.
+    await database.collection(COL.STOCK_CUBE).deleteMany({ date });
+    await database
+      .collection(cubeStage)
+      .aggregate([{ $merge: { into: COL.STOCK_CUBE, whenMatched: "replace", whenNotMatched: "insert" } }], { maxTimeMS: 0 })
+      .toArray();
+    await database.collection(cubeStage).drop().catch(() => {});
   }
-  await restoreSecondaryIndexes(database, dropped);
   await rebuildMeta();
+}
+
+/** Throws away a failed upload. The live collections were never touched. */
+export async function discardStaging({ database, fileType, dates }) {
+  const names =
+    fileType === "sale"
+      ? [STAGE[COL.SALES_FACTS]]
+      : [STAGE[COL.INVENTORY_STATE], STAGE[COL.STOCK_CUBE]];
+  for (const name of names) {
+    await database.collection(name).drop().catch(() => {});
+  }
+  // Coverage is the one thing written straight through, so it is the one thing
+  // that needs undoing.
+  if (fileType === "inventory" && dates?.[0]) {
+    await database.collection(COL.COVERAGE).deleteMany({ date: dates[0] });
+  }
 }

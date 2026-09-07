@@ -238,8 +238,16 @@ export default function FileUpload({ isOpen, onClose }) {
       }
       batchId = begun.batchId;
 
+      // Continuing an interrupted upload of the same file: batches the server
+      // already has are skipped rather than re-sent.
+      const applied = new Set(begun.appliedSeq ?? []);
+      if (begun.resumed) {
+        setMessage(`Resuming — ${applied.size} batch(es) already uploaded.`);
+      }
+
       const total = ready.rows.length;
       for (let i = 0, seq = 0; i < total; i += CHUNK_ROWS, seq += 1) {
+        if (applied.has(seq)) continue;
         const slice = ready.rows.slice(i, i + CHUNK_ROWS);
         setMessage(
           `Uploading ${Math.min(i + slice.length, total).toLocaleString()} of ${total.toLocaleString()} rows...`

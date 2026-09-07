@@ -20,6 +20,20 @@ async function dbConnect() {
   if (!cached.promise) {
     const opts = {
       bufferCommands: false,
+      // Tuned for serverless, where many short-lived instances each open their
+      // own pool rather than one process holding a large shared one.
+      //
+      // A default pool of 100 per instance multiplies across concurrent Vercel
+      // functions and can exhaust the server's connection limit; a page load
+      // fires eleven parallel requests, so this happens sooner than expected.
+      maxPoolSize: 10,
+      minPoolSize: 0,
+      // The default is 30s, which on a 60s function leaves nothing for the work
+      // itself — failing fast is more useful than timing out with no error.
+      serverSelectionTimeoutMS: 10000,
+      // Idle sockets are closed rather than held open by an instance that may
+      // never be reused.
+      maxIdleTimeMS: 60000,
     };
 
     cached.promise = mongoose.connect(MONGODB_URI, opts).then(async (mongoose) => {

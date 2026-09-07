@@ -50,6 +50,25 @@ export async function POST(req) {
       return NextResponse.json({ success: false, error: "Missing file fingerprint." }, { status: 400 });
     }
 
+    // An interrupted run of the SAME file can be continued rather than
+    // restarted: its staged rows are still there and every write is keyed on a
+    // natural id, so re-sending a batch is a no-op.
+    const interrupted = await database
+      .collection(COL.BATCHES)
+      .findOne({ fileHash: body.fileHash, status: "running" });
+    if (interrupted) {
+      return NextResponse.json({
+        success: true,
+        resumed: true,
+        batchId: String(interrupted._id),
+        appliedSeq: interrupted.appliedSeq ?? [],
+        isNewer: interrupted.isNewer,
+        branchColumns: interrupted.branchColumns,
+        dates: (interrupted.dates ?? []).map(dateSlug),
+        warnings: [],
+      });
+    }
+
     const already = await database
       .collection(COL.BATCHES)
       .findOne({ fileHash: body.fileHash, status: "committed" });
@@ -121,9 +140,8 @@ export async function POST(req) {
       await claim();
     }
 
-    // Indexes come down and the replaced rows go, once, before any batch lands.
-    const dropped = await beginBatch({ database, fileType, dates, isNewer });
-    await database.collection(COL.BATCHES).updateOne({ _id: batchId }, { $set: { dropped } });
+    // Staging is prepared; the live collections are untouched until commit.
+    await beginBatch({ database, fileType });
 
     return NextResponse.json({
       success: true,
