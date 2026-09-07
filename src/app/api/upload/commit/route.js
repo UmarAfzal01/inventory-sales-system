@@ -39,7 +39,7 @@ export async function POST(req) {
       database,
       fileType: batch.fileType,
       dates: batch.dates,
-      dropped: batch.dropped,
+      batchId: _id,
     });
     // products is upserted outside the index window, so it still bloats slowly.
     const reclaimed = await compactIndexes(database, [COL.PRODUCTS]);

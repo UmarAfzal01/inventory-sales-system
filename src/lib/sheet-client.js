@@ -12,7 +12,10 @@
  * nothing the browser sends can be trusted.
  */
 
-export const CHUNK_ROWS = 2500;
+// 2,500 rows meant roughly 6,000 individual writes per request — about 5.8s
+// against a nearby database, and past the 60s function limit from a distant
+// one. Smaller batches trade more requests for headroom against that ceiling.
+export const CHUNK_ROWS = 1000;
 
 const norm = (h) => String(h ?? "").trim().toUpperCase();
 

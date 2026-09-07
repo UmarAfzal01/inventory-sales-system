@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
 import { COL } from "@/lib/schema";
 import { requireUser } from "@/lib/guard";
-import { restoreSecondaryIndexes } from "@/lib/warehouse";
+import { discardStaging } from "@/lib/warehouse";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -35,7 +35,11 @@ export async function POST(req) {
     const batch = await database.collection(COL.BATCHES).findOne({ _id });
     if (!batch) return NextResponse.json({ success: false, error: "Unknown batch." }, { status: 404 });
 
-    await restoreSecondaryIndexes(database, batch.dropped);
+    // Nothing to undo in the live collections — a chunked upload writes only
+    // to staging, and the swap happens in commit. Dropping staging is the whole
+    // rollback.
+    await discardStaging({ database, fileType: batch.fileType, dates: batch.dates });
+
     await database.collection(COL.BATCHES).updateOne(
       { _id },
       { $set: { status: "failed", error: String(reason ?? "Cancelled").slice(0, 500) } }
