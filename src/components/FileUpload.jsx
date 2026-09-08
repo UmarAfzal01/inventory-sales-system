@@ -215,14 +215,12 @@ export default function FileUpload({ isOpen, onClose }) {
       setPreviewData(summary);
       setProgress(0);
     } catch (err) {
+      // Closed only on failure: after a successful preview the worker still
+      // holds the rows that the upload will stream out of it.
+      readerRef.current?.close();
+      readerRef.current = null;
       setErrors([err.message || "Could not read this file."]);
     } finally {
-      // The worker holds the whole sheet; leaving it running would keep that
-      // memory alive until the page navigates.
-      if (!batchId) {
-        readerRef.current?.close();
-        readerRef.current = null;
-      }
       setLoading(false);
     }
   };
@@ -334,6 +332,10 @@ export default function FileUpload({ isOpen, onClose }) {
           body: JSON.stringify({ batchId, reason: err.message }),
         }).catch(() => {});
       }
+      // The worker holds the whole sheet; leaving it running would keep that
+      // memory alive until the page navigates.
+      readerRef.current?.close();
+      readerRef.current = null;
     } finally {
       setLoading(false);
     }
@@ -602,9 +604,9 @@ export default function FileUpload({ isOpen, onClose }) {
                 </strong>
               </p>
               <p>
-                Values:{" "}
+                Batches:{" "}
                 <strong className="text-gray-900">
-                  {previewData.cells.toLocaleString()}
+                  {(previewData.chunks ?? 0).toLocaleString()}
                 </strong>
               </p>
               <p>
