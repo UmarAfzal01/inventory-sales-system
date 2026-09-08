@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { readSheet, fingerprint, CHUNK_ROWS } from "@/lib/sheet-client";
+import { openSheetReader, fingerprint, CHUNK_ROWS } from "@/lib/sheet-reader";
 import { ALL_META_HEADERS } from "@/lib/schema";
 
 /**
@@ -48,6 +48,7 @@ export default function FileUpload({ isOpen, onClose }) {
   // Parsed in the browser: the 20MB file never leaves it. What the server
   // sees is metadata, then small batches of rows.
   const [parsed, setParsed] = useState(null);
+  const readerRef = useRef(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState("");
@@ -145,31 +146,51 @@ export default function FileUpload({ isOpen, onClose }) {
    * workbook, the raw rows and a de-duplicated array at once was enough to
    * crash the tab on a large sheet.
    */
+  /**
+   * Parses the workbook in a worker and keeps it there.
+   *
+   * The reader is held in a ref rather than state: it owns the parsed rows for
+   * the whole upload, and re-rendering must not discard it. Whoever opens one
+   * is responsible for closing it.
+   */
   const parseSelectedFile = async () => {
-    const read = await readSheet(file, fileType, snapshotDate, ALL_META_HEADERS);
+    readerRef.current?.close();
+    const reader = openSheetReader();
+    readerRef.current = reader;
+
+    const read = await reader.parse({
+      file,
+      fileType,
+      snapshotDate,
+      metaHeaders: ALL_META_HEADERS,
+    });
+
     if (!read.dates.length) {
+      reader.close();
+      readerRef.current = null;
       throw new Error(
         fileType === "inventory"
           ? "Pick a snapshot date for this inventory sheet."
           : "No usable MONTH/DAY values were found in this sheet."
       );
     }
+
     const hash = await fingerprint(file);
     return {
       parsed: {
         headers: read.headers,
-        rows: read.rows,
         branchColumns: read.branchColumns,
         dates: read.dates,
+        usableRows: read.usableRows,
         hash,
       },
       summary: {
         fileType,
         totalRows: read.totalRows,
-        usableRows: read.rows.length,
+        usableRows: read.usableRows,
         branchColumns: read.branchColumns,
         dates: read.dates,
-        chunks: Math.ceil(read.rows.length / CHUNK_ROWS),
+        chunks: Math.ceil(read.usableRows / CHUNK_ROWS),
         duplicatesMerged: read.duplicatesMerged,
       },
     };
@@ -196,6 +217,12 @@ export default function FileUpload({ isOpen, onClose }) {
     } catch (err) {
       setErrors([err.message || "Could not read this file."]);
     } finally {
+      // The worker holds the whole sheet; leaving it running would keep that
+      // memory alive until the page navigates.
+      if (!batchId) {
+        readerRef.current?.close();
+        readerRef.current = null;
+      }
       setLoading(false);
     }
   };
@@ -232,7 +259,7 @@ export default function FileUpload({ isOpen, onClose }) {
           fileHash: ready.hash,
           headers: ready.headers,
           dates: ready.dates,
-          totalRows: ready.rows.length,
+          totalRows: ready.usableRows,
         }),
       }).then(readJsonResponse);
 
@@ -251,10 +278,12 @@ export default function FileUpload({ isOpen, onClose }) {
         setMessage(`Resuming — ${applied.size} batch(es) already uploaded.`);
       }
 
-      const total = ready.rows.length;
+      const total = ready.usableRows;
       for (let i = 0, seq = 0; i < total; i += CHUNK_ROWS, seq += 1) {
         if (applied.has(seq)) continue;
-        const slice = ready.rows.slice(i, i + CHUNK_ROWS);
+        // Fetched from the worker one batch at a time, so the page never holds
+        // more than the batch it is currently sending.
+        const slice = await readerRef.current.chunk(seq, i, CHUNK_ROWS);
         setMessage(
           `Uploading ${Math.min(i + slice.length, total).toLocaleString()} of ${total.toLocaleString()} rows...`
         );
@@ -286,6 +315,8 @@ export default function FileUpload({ isOpen, onClose }) {
       if (!done.success) throw new Error(done.error || "Could not finish the upload.");
 
       batchId = null;
+      readerRef.current?.close();
+      readerRef.current = null;
       setProgress(100);
       setMessage(done.message);
       setPreviewData(null);
