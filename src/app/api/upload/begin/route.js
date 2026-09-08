@@ -82,6 +82,42 @@ export async function POST(req) {
       );
     }
 
+    // Sales cannot be loaded before the catalogue exists.
+    //
+    // The inventory sheet is the only source of SALE RATE, and a fact freezes
+    // the rate at write time. Load sales first and every fact is stamped
+    // rate 0 — revenue reads zero for ever, because a later inventory upload
+    // corrects `products` but cannot reach facts already written. Categories go
+    // the same way: the sales sheet calls a category FRESH PRODUCE where the
+    // inventory sheet splits it into F&V and MEAT, and the fact keeps whichever
+    // name was current when it was written.
+    //
+    // Neither failure announces itself, so this refuses rather than warns.
+    if (fileType === "sale") {
+      const catalogued = await database.collection(COL.PRODUCTS).estimatedDocumentCount();
+      if (!catalogued) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              "Upload the inventory sheet first. It is the product catalogue and " +
+              "the only source of sale rates — loading sales before it records " +
+              "every sale at a price of zero, and re-uploading them is the only fix.",
+          },
+          { status: 409 }
+        );
+      }
+      const priced = await database
+        .collection(COL.PRODUCTS)
+        .countDocuments({ saleRate: { $gt: 0 } }, { limit: 1 });
+      if (!priced) {
+        headerCheck.warnings.push(
+          "No product in the catalogue has a sale rate, so revenue will show as zero. " +
+            "Upload an inventory sheet that includes SALE RATE first."
+        );
+      }
+    }
+
     // A back-dated inventory sheet is recorded as history but must not become
     // the current stock position.
     let isNewer = true;

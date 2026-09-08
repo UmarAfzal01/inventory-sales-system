@@ -19,6 +19,18 @@ export default function ClientLayoutWrapper({ children }) {
   // hidden button is not a permission.
   const [me, setMe] = useState(null);
   useEffect(() => {
+    // Re-runs when the route changes, not just on mount.
+    //
+    // This component lives in the root layout, so it stays mounted while the
+    // login page navigates to the dashboard. With `[router]` as the only
+    // dependency it fetched once — on /login, where the answer is 401 — and
+    // never again, so the admin controls stayed hidden until a full reload.
+    //
+    // `me` in the dependencies stops it refetching on every later navigation:
+    // once loaded, the guard below returns immediately.
+    const onAuthRoute = pathname === "/login" || pathname === "/";
+    if (onAuthRoute || me) return;
+
     let cancelled = false;
     fetch("/api/auth/me")
       .then((r) => r.json())
@@ -38,7 +50,7 @@ export default function ClientLayoutWrapper({ children }) {
     return () => {
       cancelled = true;
     };
-  }, [router]);
+  }, [router, pathname, me]);
   const isAdminUser = me?.role === "admin";
   // On /sales the sidebar shows money per branch; the stock counts belong
   // to the inventory view.
@@ -109,6 +121,9 @@ export default function ClientLayoutWrapper({ children }) {
       // still-valid cookie and sent you straight back to the dashboard.
       // Only the server can expire it.
       await fetch("/api/auth/logout", { method: "POST" });
+      // Cleared explicitly: the component survives the navigation to /login,
+      // so a stale `me` would otherwise persist into the next session.
+      setMe(null);
     } catch (err) {
       console.error("Failed to sign out:", err);
     } finally {
