@@ -1,14 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import {
-  readWorkbook,
-  fingerprint,
-  dedupeRows,
-  datesInRows,
-  detectBranchColumns,
-  CHUNK_ROWS,
-} from "@/lib/sheet-client";
+import { readSheet, fingerprint, CHUNK_ROWS } from "@/lib/sheet-client";
 import { ALL_META_HEADERS } from "@/lib/schema";
 
 /**
@@ -144,12 +137,17 @@ export default function FileUpload({ isOpen, onClose }) {
    * that, the button called an upload that returned immediately because nothing
    * had been parsed, and nothing happened at all.
    */
+  /**
+   * Reads and de-duplicates the workbook in the browser.
+   *
+   * Shared by both entry points: the sales flow previews first, while the
+   * inventory flow uploads in one click. One pass, one copy — holding the
+   * workbook, the raw rows and a de-duplicated array at once was enough to
+   * crash the tab on a large sheet.
+   */
   const parseSelectedFile = async () => {
-    const { headers, rows } = await readWorkbook(file);
-    const branchColumns = detectBranchColumns(headers, ALL_META_HEADERS);
-    const deduped = dedupeRows(rows, fileType, branchColumns);
-    const dates = datesInRows(deduped, fileType, snapshotDate);
-    if (!dates.length) {
+    const read = await readSheet(file, fileType, snapshotDate, ALL_META_HEADERS);
+    if (!read.dates.length) {
       throw new Error(
         fileType === "inventory"
           ? "Pick a snapshot date for this inventory sheet."
@@ -157,16 +155,24 @@ export default function FileUpload({ isOpen, onClose }) {
       );
     }
     const hash = await fingerprint(file);
-    const summary = {
-      fileType,
-      totalRows: rows.length,
-      usableRows: deduped.length,
-      branchColumns,
-      dates,
-      chunks: Math.ceil(deduped.length / CHUNK_ROWS),
-      duplicatesMerged: rows.length - deduped.length,
+    return {
+      parsed: {
+        headers: read.headers,
+        rows: read.rows,
+        branchColumns: read.branchColumns,
+        dates: read.dates,
+        hash,
+      },
+      summary: {
+        fileType,
+        totalRows: read.totalRows,
+        usableRows: read.rows.length,
+        branchColumns: read.branchColumns,
+        dates: read.dates,
+        chunks: Math.ceil(read.rows.length / CHUNK_ROWS),
+        duplicatesMerged: read.duplicatesMerged,
+      },
     };
-    return { parsed: { headers, rows: deduped, branchColumns, dates, hash }, summary };
   };
 
   const handlePreview = async (e) => {
