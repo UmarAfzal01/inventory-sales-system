@@ -931,7 +931,9 @@ export async function readProducts({
 
   const catalogue = await database
     .collection(COL.PRODUCTS)
-    .find(catalogueQuery, { projection: { articleName: 1, type: 1, sellingStatus: 1 } })
+    .find(catalogueQuery, {
+      projection: { articleName: 1, type: 1, sellingStatus: 1, saleRate: 1 },
+    })
     .limit(scoped ? 0 : 500)
     .toArray();
 
@@ -1107,6 +1109,10 @@ export async function readProducts({
       articleName: byId.get(x.barcode)?.articleName ?? "(unknown)",
       type: byId.get(x.barcode)?.type ?? "",
       sellingStatus: byId.get(x.barcode)?.sellingStatus ?? "",
+      // The catalogue's CURRENT price, not the one a past sale was made at —
+      // facts carry their own frozen `rate` for that. This is what the product
+      // sells for today.
+      saleRate: byId.get(x.barcode)?.saleRate ?? 0,
     })),
     stats,
     branches: [...branchCount].sort(),

@@ -1117,7 +1117,7 @@ export default function DashboardPage() {
               <h2 className="text-xl font-extrabold tracking-tight text-slate-900 drop-shadow-sm">
                 {productData
                   ? productSearch
-                    ? `Products matching "${productSearch}"${selectedCategory ? ` in ${selectedSubCategory || selectedCategory}` : ""}`
+                    ? `Products matching "${productSearch}" across all categories`
                     : `Products in "${selectedSubCategory || "—"}"`
                   : selectedCategory
                     ? `Last Level Categories for "${selectedCategory}"`
@@ -1219,9 +1219,30 @@ export default function DashboardPage() {
                         className="bg-white rounded-2xl border border-slate-200/80 p-4 shadow-[0_6px_20px_rgba(0,0,0,0.04)] hover:shadow-[0_10px_28px_rgba(0,0,0,0.07)] transition"
                       >
                         <div className="flex items-start justify-between gap-3">
-                          <span className="px-2.5 py-1 rounded-full bg-blue-50 border border-blue-100 text-[11px] font-extrabold text-blue-700 font-mono">
-                            SKU: {p.barcode}
-                          </span>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="px-2.5 py-1 rounded-full bg-blue-50 border border-blue-100 text-[11px] font-extrabold text-blue-700 font-mono">
+                              SKU: {p.barcode}
+                            </span>
+                            {/* Shown even without a price: hiding it made an
+                                unpriced product look the same as a free one,
+                                and the whole card silently loses revenue. */}
+                            <span
+                              title={
+                                p.saleRate > 0
+                                  ? "Sale rate from the inventory sheet"
+                                  : "No sale rate in the inventory sheet, so this product contributes nothing to revenue"
+                              }
+                              className={`px-2.5 py-1 rounded-full text-[11px] font-extrabold tabular-nums ${
+                                p.saleRate > 0
+                                  ? "bg-violet-50 border border-violet-100 text-violet-700"
+                                  : "bg-slate-100 border border-slate-200 text-slate-500"
+                              }`}
+                            >
+                              {p.saleRate > 0
+                                ? `Price: Rs ${formatAmount(p.saleRate)}`
+                                : "Price: Unknown"}
+                            </span>
+                          </div>
                           <span className="text-[11px] font-bold text-slate-300">
                             #{rank}
                           </span>
@@ -1242,6 +1263,7 @@ export default function DashboardPage() {
                               {p.sellingStatus}
                             </span>
                           )}
+
                           <span className="ml-auto text-xs font-extrabold text-slate-900 tabular-nums">
                             {isSales
                               ? formatAmount(p.amount)

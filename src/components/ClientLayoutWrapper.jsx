@@ -56,6 +56,10 @@ export default function ClientLayoutWrapper({ children }) {
   // to the inventory view.
   const isSalesView = (pathname || "").startsWith("/sales");
 
+  // The branch list must link within whichever view is open, or clicking a
+  // branch on the sales page would bounce back to inventory.
+  const viewRoot = pathname?.startsWith("/sales") ? "/sales" : "/dashboard";
+
   // Changing branch must keep every other parameter — category, sub-category,
   // dates, type, status. Linking to a bare /dashboard?branch=X threw the user
   // back to the top level and silently dropped their filters.
@@ -65,8 +69,24 @@ export default function ClientLayoutWrapper({ children }) {
     else params.delete("branch");
     params.delete("page"); // a different branch means a different result set
     const qs = params.toString();
-    return qs ? `/dashboard?${qs}` : "/dashboard";
+    return qs ? `${viewRoot}?${qs}` : viewRoot;
   };
+
+  /**
+   * Switching between the inventory and sales views keeps the current filters.
+   *
+   * Both views read the same parameters — branch, type, selling status, date
+   * range, and where you have drilled to — so a bare href reset all of it and
+   * dropped the user back to an unfiltered top level. Only `page` is discarded,
+   * because a paginated position does not survive a change of metric.
+   */
+  const viewHref = (root) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("page");
+    const qs = params.toString();
+    return qs ? `${root}?${qs}` : root;
+  };
+
 
   const [branchesData, setBranchesData] = useState([]);
   const [loadingBranches, setLoadingBranches] = useState(true);
@@ -179,7 +199,7 @@ export default function ClientLayoutWrapper({ children }) {
                 <div className="text-[11px] font-extrabold uppercase tracking-wider text-slate-400 px-3 mb-2">Overview</div>
                 <div className="space-y-1">
                   <Link 
-                    href="/dashboard" 
+                    href={viewHref("/dashboard")} 
                     className={`flex items-center gap-2.5 px-3.5 py-2.5 rounded-2xl text-xs font-bold backdrop-blur-xl transition ${
                       pathname === "/dashboard" && !currentBranch
                         ? "bg-white/50 border border-white/70 text-blue-700 shadow-[0_8px_20px_rgba(37,99,235,0.1)]" 
@@ -191,7 +211,7 @@ export default function ClientLayoutWrapper({ children }) {
                   </Link>
                   {isAdminUser && (
                     <Link 
-                    href="/sales" 
+                    href={viewHref("/sales")} 
                     className={`flex items-center gap-2.5 px-3.5 py-2.5 rounded-2xl text-xs font-bold backdrop-blur-xl transition ${
                       pathname === "/sales" && !currentBranch
                         ? "bg-white/50 border border-white/70 text-blue-700 shadow-[0_8px_20px_rgba(37,99,235,0.1)]" 

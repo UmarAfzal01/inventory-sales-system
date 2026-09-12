@@ -46,8 +46,13 @@ export async function GET(req) {
     const subCategory = q.get("subCategory");
     const search = (q.get("q") || "").trim();
 
-    // A search term always yields products, whatever level the user is on —
-    // scoped to the category/sub-category if they have drilled in, global if not.
+    // A search term searches the WHOLE catalogue, whatever level the user is on.
+    //
+    // It used to stay confined to the category they had drilled into, which
+    // made a search from inside CONFECTIONERY for a GROCERIES product return
+    // nothing at all — indistinguishable from the product not existing. A
+    // control labelled "search any product" has to mean it, so the drill-down
+    // position is dropped while a term is present and restored when it clears.
     if (search || (category && subCategory !== null)) {
       const level3 = await readProducts({
         branch: q.get("branch") || "ALL",
@@ -55,8 +60,8 @@ export async function GET(req) {
         sellingStatus: q.get("sellingStatus") || "ALL",
         from: parseIsoDate(q.get("from")),
         to: parseIsoDate(q.get("to")),
-        category,
-        subCategory,
+        category: search ? null : category,
+        subCategory: search ? null : subCategory,
         q: search,
         metricFilter,
         scope,
