@@ -175,6 +175,16 @@ async function applySchema(db) {
         // Only non-zero readings are stored. null is impossible here: a missing
         // reading means no document, which is what keeps blank distinct from 0.
         qty: { bsonType: ["double", "int", "long"] },
+        // Frozen at snapshot time, exactly as a sales fact freezes `rate`:
+        // stock is valued at the price that prevailed when it was counted, not
+        // at whatever the product happens to cost today. Denormalised because
+        // the alternative — joining 463k rows to `products` at read time —
+        // measured 47s against the live data.
+        //
+        // Absent on rows written before valuation existed; every read applies
+        // $ifNull, so an un-backfilled row values at zero rather than breaking.
+        costPrice: { bsonType: ["double", "int", "long", "null"] },
+        saleRate: { bsonType: ["double", "int", "long", "null"] },
         asOf: { bsonType: "date" },
       },
     },

@@ -836,6 +836,8 @@ export async function readProducts({
   // than computed and then hidden — a field omitted from the response cannot
   // leak through the API.
   includeAmount = false,
+  // Stock at cost, held to the same rule — see readDashboard.
+  includeCost = false,
 } = {}) {
   const database = db();
   // category / subCategory are optional. With neither, this is a global product
@@ -973,7 +975,42 @@ export async function readProducts({
           .collection(COL.INVENTORY_STATE)
           .aggregate([
             { $match: stockMatch },
-            { $group: { _id: { b: "$barcode", br: "$branch" }, qty: { $sum: "$qty" } } },
+            {
+              $group: {
+                _id: { b: "$barcode", br: "$branch" },
+                qty: { $sum: "$qty" },
+                // Valued from the price frozen onto the snapshot row, not from
+                // the catalogue's price today, so this level agrees exactly
+                // with the figures at levels 1 and 2. Positive rows only, for
+                // the same reason as there.
+                ...(includeCost
+                  ? {
+                      costValue: {
+                        $sum: {
+                          $cond: [
+                            { $gt: ["$qty", 0] },
+                            { $multiply: ["$qty", { $ifNull: ["$costPrice", 0] }] },
+                            0,
+                          ],
+                        },
+                      },
+                    }
+                  : {}),
+                saleValue: {
+                  $sum: {
+                    $cond: [
+                      { $gt: ["$qty", 0] },
+                      { $multiply: ["$qty", { $ifNull: ["$saleRate", 0] }] },
+                      0,
+                    ],
+                  },
+                },
+                // Priced rows, not merely rows carrying the field — see
+                // readDashboard. A sheet without its SALE RATE column parses
+                // to 0, which must read as "not priced", never as Rs 0.
+                valuedRows: { $sum: { $cond: [{ $gt: ["$saleRate", 0] }, 1, 0] } },
+              },
+            },
           ])
           .toArray()
       : Promise.resolve([]),
@@ -995,6 +1032,7 @@ export async function readProducts({
       merged.set(barcode, {
         barcode, sale: 0, pos: 0, neg: 0, amount: 0, stock: 0,
         branchStock: {}, branchSales: {}, branchAmount: {},
+        branchSaleValue: {}, branchCostValue: {},
       });
     }
     return merged.get(barcode);
@@ -1015,10 +1053,18 @@ export async function readProducts({
       t.branchAmount[r._id.br] = r.amount ?? 0;
     }
   }
+  let valuedStockRows = 0;
   for (const r of stock) {
     const t = slot(r._id.b);
     t.branchStock[r._id.br] = r.qty;
     t.stock += r.qty;
+    t.saleValue = (t.saleValue ?? 0) + (r.saleValue ?? 0);
+    t.branchSaleValue[r._id.br] = r.saleValue ?? 0;
+    if (includeCost) {
+      t.costValue = (t.costValue ?? 0) + (r.costValue ?? 0);
+      t.branchCostValue[r._id.br] = r.costValue ?? 0;
+    }
+    valuedStockRows += r.valuedRows ?? 0;
   }
 
   // Best sellers first; barcode breaks ties so paging is stable.
@@ -1069,6 +1115,8 @@ export async function readProducts({
         negativeSales: a.negativeSales + p.neg,
         amount: a.amount + (p.amount ?? 0),
         totalInventory: a.totalInventory + p.stock,
+        stockCostValue: a.stockCostValue + (p.costValue ?? 0),
+        stockSaleValue: a.stockSaleValue + (p.saleValue ?? 0),
         negativeStock:
           a.negativeStock + (Object.values(p.branchStock).some((q) => q < 0) ? 1 : 0),
         // Zero somewhere = not stocked at every covered branch, the same
@@ -1079,7 +1127,8 @@ export async function readProducts({
       };
     },
     { totalProducts: 0, totalSales: 0, positiveSales: 0, negativeSales: 0, amount: 0,
-      totalInventory: 0, negativeStock: 0, zeroStock: 0, zeroSales: 0 }
+      totalInventory: 0, stockCostValue: 0, stockSaleValue: 0,
+      negativeStock: 0, zeroStock: 0, zeroSales: 0 }
   );
   if (!includeAmount) {
     delete stats.amount;
@@ -1087,6 +1136,20 @@ export async function readProducts({
       delete p.amount;
       delete p.branchAmount;
     }
+  }
+  if (!includeCost) {
+    delete stats.stockCostValue;
+    for (const p of all) {
+      delete p.costValue;
+      delete p.branchCostValue;
+    }
+  }
+  // A snapshot exists but carries no prices — a count taken before valuation
+  // shipped. Its quantities are real, so reporting Rs 0 would be a wrong
+  // figure rather than a missing one.
+  if (stockDate && !valuedStockRows) {
+    stats.stockSaleValue = null;
+    if (includeCost) stats.stockCostValue = null;
   }
 
   // Unknown, not zero — same reasoning as levels 1 and 2. Without this every
@@ -1096,6 +1159,8 @@ export async function readProducts({
     stats.negativeStock = null;
     stats.zeroStock = null;
     stats.zeroSales = null;
+    stats.stockSaleValue = null;
+    if (includeCost) stats.stockCostValue = null;
   }
 
   const slice = visible.slice((page - 1) * pageSize, page * pageSize);
@@ -1160,6 +1225,10 @@ export async function readDashboard({
   category = null,
   metricFilter = null,
   scope = UNRESTRICTED,
+  // Cost price is held to the same rule as revenue, and for a sharper reason:
+  // cost shown beside sale value discloses margin. Stock at sale price supports
+  // no such inference, so it stays visible to every user within their scope.
+  includeCost = false,
   // Revenue is admin-only, so it is not computed at all for anyone else rather
   // than computed and then hidden — a field omitted from the response cannot
   // leak through the API.
@@ -1328,6 +1397,34 @@ export async function readDashboard({
                 qty: { $sum: "$qty" },
                 branchesWithStock: { $sum: 1 },
                 neg: { $max: { $cond: [{ $lt: ["$qty", 0] }, 1, 0] } },
+                // Per branch row, before the branches collapse: a product held
+                // +50 at one branch and -10 at another is worth 50, not 40.
+                ...(includeCost
+                  ? {
+                      posCost: {
+                        $sum: {
+                          $cond: [
+                            { $gt: ["$qty", 0] },
+                            { $multiply: ["$qty", { $ifNull: ["$costPrice", 0] }] },
+                            0,
+                          ],
+                        },
+                      },
+                    }
+                  : {}),
+                posSale: {
+                  $sum: {
+                    $cond: [
+                      { $gt: ["$qty", 0] },
+                      { $multiply: ["$qty", { $ifNull: ["$saleRate", 0] }] },
+                      0,
+                    ],
+                  },
+                },
+                // See the cube branch below: separates "no value" from "not
+                // priced", so neither an un-backfilled row nor a sheet that
+                // arrived without its price columns reports a confident Rs 0.
+                valuedRows: { $sum: { $cond: [{ $gt: ["$saleRate", 0] }, 1, 0] } },
               },
             },
             {
@@ -1335,6 +1432,9 @@ export async function readDashboard({
                 _id: "$_id.sub",
                 totalInventory: { $sum: "$qty" },
                 withStock: { $sum: 1 },
+                ...(includeCost ? { costValue: { $sum: "$posCost" } } : {}),
+                saleValue: { $sum: "$posSale" },
+                valuedRows: { $sum: "$valuedRows" },
                 // "Stocked everywhere" — needed because zero stock means zero at
                 // ANY branch, which is the definition level 1 uses. Counting
                 // products with no stock at all instead reported far fewer.
@@ -1357,6 +1457,22 @@ export async function readDashboard({
                 totalInventory: { $sum: "$totalQty" },
                 negativeStockCount: { $sum: "$negativeStockCount" },
                 zeroStockCount: { $sum: "$zeroStockCount" },
+                ...(includeCost
+                  ? { costValue: { $sum: { $ifNull: ["$costValue", 0] } } }
+                  : {}),
+                saleValue: { $sum: { $ifNull: ["$saleValue", 0] } },
+                // Valuation cannot be reconstructed for a snapshot taken before
+                // this feature shipped: inventory_state holds only the current
+                // count, so historical per-product prices are simply gone. The
+                // cube's totalQty survives, which is exactly the trap — summing
+                // a missing costValue yields a confident Rs 0 for a date that
+                // really holds millions.
+                //
+                // Tested for a value rather than for the field's presence: a
+                // sheet missing its SALE RATE column parses to 0, not null, so
+                // a presence check would pass and report Rs 0 against real
+                // stock. Nothing priced anywhere means not known, not nothing.
+                valuedRows: { $sum: { $cond: [{ $gt: ["$saleValue", 0] }, 1, 0] } },
               },
             },
           ])
@@ -1404,7 +1520,7 @@ export async function readDashboard({
       merged.set(keyName, {
         categoryName: keyName,
         totalSales: 0, positiveSales: 0, negativeSales: 0, amount: 0,
-        totalInventory: 0, productCount: 0,
+        totalInventory: 0, productCount: 0, costValue: 0, saleValue: 0,
         negativeStockCount: 0, zeroStockCount: 0, zeroSalesCount: 0,
       });
     }
@@ -1415,8 +1531,17 @@ export async function readDashboard({
     totalSales: s.totalSales, positiveSales: s.positiveSales, negativeSales: s.negativeSales,
     ...(includeAmount ? { amount: s.amount ?? 0 } : {}),
   });
+  // How many of the rows behind these figures actually carried a price. Zero
+  // means this snapshot predates valuation, and the totals below are not zero
+  // but unknown.
+  let valuedStockRows = 0;
+
   for (const s of stock) {
     const t = slot(s._id);
+    // Same shape from both sources, so this sits outside the branch below.
+    t.saleValue = s.saleValue ?? 0;
+    if (includeCost) t.costValue = s.costValue ?? 0;
+    valuedStockRows += s.valuedRows ?? 0;
     // Keyed off the same switch that chose the source. Reading the cube's shape
     // from an inventory_state result left productCount undefined, which surfaced
     // as a null product count the moment any scope was applied.
@@ -1465,6 +1590,10 @@ export async function readDashboard({
       c.negativeStockCount = null;
       c.zeroStockCount = null;
       c.zeroSalesCount = null;
+      // Stock nobody counted has no value. Left at the slot's default 0 these
+      // would render as a priced "Rs 0" on every category card.
+      c.saleValue = null;
+      c.costValue = null;
     }
   }
 
@@ -1486,16 +1615,23 @@ export async function readDashboard({
       positiveSales: a.positiveSales + c.positiveSales,
       negativeSales: a.negativeSales + c.negativeSales,
       amount: a.amount + (c.amount ?? 0),
+      stockCostValue: a.stockCostValue + (c.costValue ?? 0),
+      stockSaleValue: a.stockSaleValue + (c.saleValue ?? 0),
       negativeStock: a.negativeStock + (c.negativeStockCount ?? 0),
       zeroStock: a.zeroStock + (c.zeroStockCount ?? 0),
       zeroSales: a.zeroSales + (c.zeroSalesCount ?? 0),
     }),
     { totalProducts: 0, totalInventory: 0, totalSales: 0, positiveSales: 0,
-      negativeSales: 0, amount: 0, negativeStock: 0, zeroStock: 0, zeroSales: 0 }
+      negativeSales: 0, amount: 0, stockCostValue: 0, stockSaleValue: 0,
+      negativeStock: 0, zeroStock: 0, zeroSales: 0 }
   );
   if (!includeAmount) {
     delete stats.amount;
     for (const c of allCategories) delete c.amount;
+  }
+  if (!includeCost) {
+    delete stats.stockCostValue;
+    for (const c of allCategories) delete c.costValue;
   }
 
   // The headline cards get the same treatment, for the same reason.
@@ -1504,6 +1640,20 @@ export async function readDashboard({
     stats.negativeStock = null;
     stats.zeroStock = null;
     stats.zeroSales = null;
+    // No snapshot means no stock, and stock nobody has counted has no value.
+    // Zero would read as "the shelves are empty", which is a different claim.
+    stats.stockSaleValue = null;
+    if (includeCost) stats.stockCostValue = null;
+  } else if (!valuedStockRows) {
+    // A snapshot exists but nothing in it is priced — a date counted before
+    // valuation shipped. Its quantities are real, so the stock cards must not
+    // report Rs 0 against them.
+    stats.stockSaleValue = null;
+    if (includeCost) stats.stockCostValue = null;
+    for (const c of allCategories) {
+      c.saleValue = null;
+      if (includeCost) c.costValue = null;
+    }
   }
 
   return {
@@ -1677,10 +1827,20 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
     const subCategory = r.product.subCategory || "";
     const type = r.product.type || "";
     const status = r.product.sellingStatus || "";
+    // Straight off the sheet — COST PRICE and SALE RATE are columns on the
+    // inventory workbook, so no catalogue lookup is needed to value a row.
+    const costPrice = r.product.costPrice ?? 0;
+    const saleRate = r.product.saleRate ?? 0;
 
     let nonZeroBranches = 0;
     let productTotal = 0;
     let productNegative = false;
+    // Valuation counts stock a branch actually holds. Negative quantities are
+    // data errors, not liabilities — two typo'd rows in this dataset sum to
+    // -15.2M units, enough to drag a Rs 3.5B valuation below zero — and they
+    // are already reported by the Negative Stock metric.
+    let productCostValue = 0;
+    let productSaleValue = 0;
 
     for (const branch of branches) {
       const cell = r.cells.find((c) => c.branch === branch);
@@ -1694,12 +1854,19 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
         bump(id, base, "nonZero", 1);
         bump(id, base, "totalQty", qty);
         if (qty < 0) bump(id, base, "negativeStockCount", 1);
+        if (qty > 0) {
+          bump(id, base, "costValue", qty * costPrice);
+          bump(id, base, "saleValue", qty * saleRate);
+          productCostValue += qty * costPrice;
+          productSaleValue += qty * saleRate;
+        }
         nonZeroBranches += 1;
         productTotal += qty;
         if (qty < 0) productNegative = true;
         stateDocs.push({
           _id: `${branch}|${r.barcode}`,
-          branch, barcode: r.barcode, qty, category, subCategory, asOf, batchId,
+          branch, barcode: r.barcode, qty, category, subCategory,
+          costPrice, saleRate, asOf, batchId,
         });
       }
       coverage.set(branch, (coverage.get(branch) ?? 0) + 1);
@@ -1709,6 +1876,10 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
     const allBase = { date: asOf, branch: ALL, category, type, sellingStatus: status };
     bump(allId, allBase, "productCount", 1);
     bump(allId, allBase, "totalQty", productTotal);
+    // Summed across branches, unlike the counts above: value is additive, so a
+    // product held at three branches contributes all three holdings.
+    bump(allId, allBase, "costValue", productCostValue);
+    bump(allId, allBase, "saleValue", productSaleValue);
     if (productNegative) bump(allId, allBase, "negativeStockCount", 1);
     // Out of stock somewhere counts once for the product, not once per branch.
     if (nonZeroBranches < branches.length) bump(allId, allBase, "zeroStockCount", 1);

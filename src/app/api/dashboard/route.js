@@ -24,6 +24,10 @@ export async function GET(req) {
     // Revenue is admin-only. Passed as a flag rather than stripped afterwards,
     // so it is never computed or serialised for anyone else.
     const includeAmount = user.role === "admin";
+    // Stock at cost follows the same rule: cost beside sale value discloses
+    // margin, which a branch manager has no need of. Stock at sale price is
+    // returned to everyone, scoped as usual.
+    const includeCost = user.role === "admin";
 
     await dbConnect();
     // ensureSchema deliberately NOT called here. It is a write-path concern —
@@ -66,6 +70,7 @@ export async function GET(req) {
         metricFilter,
         scope,
         includeAmount,
+        includeCost,
         page: Math.max(1, parseInt(q.get("page") || "1", 10) || 1),
         pageSize: Math.min(200, Math.max(1, parseInt(q.get("pageSize") || "50", 10) || 50)),
       });
@@ -82,6 +87,7 @@ export async function GET(req) {
       metricFilter,
       scope,
       includeAmount,
+      includeCost,
     });
 
     if (!data.ready) {
