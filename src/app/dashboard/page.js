@@ -1096,13 +1096,13 @@ export default function DashboardPage() {
         </div>
 
         {/* Stock Valuation — the current snapshot priced two ways.
-            Sales overview only, and at every drill-down level: first-level
+            Inventory overview only, and at every drill-down level: first-level
             categories, sub-categories, and the products page, each valuing
             exactly the stock in view. Deliberately its own section rather than
             two more cards in the grid above: those cards are click-to-filter
             metrics, and these are not clickable. Stock at cost is admin-only,
             so `stats.stockCostValue` is simply absent for everyone else. */}
-        {isSales && stockAvailable && stats?.stockSaleValue != null && (
+        {!isSales && stockAvailable && stats?.stockSaleValue != null && (
           <div className="mb-10">
             <div className="flex items-baseline justify-between gap-4 mb-4 flex-wrap">
               <h2 className="text-xl font-extrabold tracking-tight text-slate-900 drop-shadow-sm">
@@ -1305,6 +1305,61 @@ export default function DashboardPage() {
                                 ? `Price: Rs ${formatAmount(p.saleRate)}`
                                 : "Price: Unknown"}
                             </span>
+                            {/* Sits with SKU and Price: these are all
+                                identifying figures for the product, and the
+                                row below is for its classification tags. */}
+                          {isSales ? (
+                            <span
+                              title={exactAmount(p.amount)}
+                              className="px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-100 text-[11px] font-extrabold tabular-nums text-emerald-700"
+                            >
+                              <span className="text-emerald-500/80">Sale: </span>
+                              {formatAmount(p.amount)}
+                            </span>
+                          ) : (
+                            <>
+                              <span className="px-2.5 py-1 rounded-full bg-indigo-50 border border-indigo-100 text-[11px] font-extrabold tabular-nums text-indigo-700">
+                                <span className="text-indigo-400">Sold: </span>
+                                {Math.round(p.sale).toLocaleString()}
+                              </span>
+                              <span
+                                className={`px-2.5 py-1 rounded-full text-[11px] font-extrabold tabular-nums ${
+                                  p.stock < 0
+                                    ? "bg-rose-50 border border-rose-200 text-rose-700"
+                                    : "bg-emerald-50 border border-emerald-100 text-emerald-700"
+                                }`}
+                              >
+                                <span
+                                  className={
+                                    p.stock < 0 ? "text-rose-400" : "text-emerald-500/80"
+                                  }
+                                >
+                                  Stock:{" "}
+                                </span>
+                                {Math.round(p.stock).toLocaleString()}
+                              </span>
+                              {/* Null, not zero, when the snapshot behind
+                                  this product carries no prices. */}
+                              {p.saleValue != null && (
+                                <span
+                                  title={exactAmount(p.saleValue)}
+                                  className="px-2.5 py-1 rounded-full bg-sky-50 border border-sky-100 text-[11px] font-extrabold tabular-nums text-sky-700"
+                                >
+                                  <span className="text-sky-400">Value: </span>
+                                  {formatAmount(p.saleValue)}
+                                </span>
+                              )}
+                              {p.costValue != null && (
+                                <span
+                                  title={exactAmount(p.costValue)}
+                                  className="px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200 text-[11px] font-extrabold tabular-nums text-slate-600"
+                                >
+                                  <span className="text-slate-400">Cost: </span>
+                                  {formatAmount(p.costValue)}
+                                </span>
+                              )}
+                            </>
+                          )}
                           </div>
                           <span className="text-[11px] font-bold text-slate-300">
                             #{rank}
@@ -1327,72 +1382,13 @@ export default function DashboardPage() {
                             </span>
                           )}
 
-                          <span className="ml-auto text-xs font-extrabold text-slate-900 tabular-nums">
-                            {isSales ? (
-                              <>
-                                <span title={exactAmount(p.amount)}>
-                                  {formatAmount(p.amount)}
-                                </span>
-                                <span className="text-[10px] font-bold text-slate-400">
-                                  {" "}
-                                  sale
-                                </span>
-                                {/* Null, not zero, when the snapshot behind
-                                    this product carries no prices. */}
-                                {p.saleValue != null && (
-                                  <>
-                                    <span className="text-slate-300"> · </span>
-                                    <span
-                                      className="text-sky-700"
-                                      title={exactAmount(p.saleValue)}
-                                    >
-                                      {formatAmount(p.saleValue)}
-                                    </span>
-                                    <span className="text-[10px] font-bold text-slate-400">
-                                      {" "}
-                                      stock value
-                                    </span>
-                                  </>
-                                )}
-                                {p.costValue != null && (
-                                  <>
-                                    <span className="text-slate-300"> · </span>
-                                    <span
-                                      className="text-slate-600"
-                                      title={exactAmount(p.costValue)}
-                                    >
-                                      {formatAmount(p.costValue)}
-                                    </span>
-                                    <span className="text-[10px] font-bold text-slate-400">
-                                      {" "}
-                                      stock cost
-                                    </span>
-                                  </>
-                                )}
-                              </>
-                            ) : (
-                              <>
-                                {Math.round(p.sale).toLocaleString()}
-                                <span className="text-[10px] font-bold text-slate-400">
-                                  {" "}
-                                  units sold
-                                </span>
-                                <span className="text-slate-300"> · </span>
-                                {Math.round(p.stock).toLocaleString()}
-                                <span className="text-[10px] font-bold text-slate-400">
-                                  {" "}
-                                  stock
-                                </span>
-                              </>
-                            )}
-                          </span>
                         </div>
 
                         <div className="mt-3 pt-3 border-t border-slate-100">
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
                               {isSales
-                                ? "Sale & stock by branch"
+                                ? "Sale by branch"
                                 : (BRANCH_HEADING[activeMetricFilter] ?? "Branch Quantities")}
                             </span>
                             {/* Color-key legend so the two badges in each cell are self-explanatory
@@ -1405,7 +1401,7 @@ export default function DashboardPage() {
                                   {isSales ? "Sale" : "Sold"}
                                 </span>
                               </span>
-                              {isSales && (
+                              {!isSales && stats?.stockSaleValue !== undefined && (
                                 <span className="flex items-center gap-1">
                                   <span className="w-2 h-2 rounded-full bg-sky-500"></span>
                                   <span className="text-sky-600">Stock value</span>
@@ -1414,7 +1410,7 @@ export default function DashboardPage() {
                               {/* Admin-only, and keyed off the same field the
                                   cells read, so the legend can never advertise
                                   a badge that is not rendered. */}
-                              {isSales && stats?.stockCostValue !== undefined && (
+                              {!isSales && stats?.stockCostValue !== undefined && (
                                 <span className="flex items-center gap-1">
                                   <span className="w-2 h-2 rounded-full bg-slate-400"></span>
                                   <span className="text-slate-500">Stock cost</span>
@@ -1449,7 +1445,9 @@ export default function DashboardPage() {
                               // branch with zero stock show "0" for value and
                               // nothing for cost, which looked like missing
                               // data rather than an empty shelf.
-                              const stockVal = p.branchSaleValue?.[b] ?? 0;
+                              const stockVal = p.branchSaleValue
+                                ? (p.branchSaleValue[b] ?? 0)
+                                : undefined;
                               const stockCost = p.branchCostValue
                                 ? (p.branchCostValue[b] ?? 0)
                                 : undefined;
@@ -1478,30 +1476,6 @@ export default function DashboardPage() {
                                         ? formatAmount(p.branchAmount?.[b] ?? 0)
                                         : Math.round(sold).toLocaleString()}
                                     </span>
-                                    {isSales && (
-                                      <span
-                                        title={exactAmount(stockVal)}
-                                        className={`px-1.5 py-0.5 rounded-md text-[11px] font-extrabold tabular-nums ${
-                                          stockVal
-                                            ? "bg-sky-50 text-sky-700"
-                                            : "bg-slate-100 text-slate-400"
-                                        }`}
-                                      >
-                                        {formatAmount(stockVal)}
-                                      </span>
-                                    )}
-                                    {isSales && stockCost !== undefined && (
-                                      <span
-                                        title={exactAmount(stockCost)}
-                                        className={`px-1.5 py-0.5 rounded-md text-[11px] font-extrabold tabular-nums ${
-                                          stockCost
-                                            ? "bg-slate-200 text-slate-600"
-                                            : "bg-slate-100 text-slate-400"
-                                        }`}
-                                      >
-                                        {formatAmount(stockCost)}
-                                      </span>
-                                    )}
                                     {!isSales && (
                                       <span
                                         className={`px-1.5 py-0.5 rounded-md text-[11px] font-extrabold tabular-nums ${
@@ -1513,6 +1487,30 @@ export default function DashboardPage() {
                                         }`}
                                       >
                                         {Math.round(qty).toLocaleString()}
+                                      </span>
+                                    )}
+                                    {!isSales && stockVal !== undefined && (
+                                      <span
+                                        title={exactAmount(stockVal)}
+                                        className={`px-1.5 py-0.5 rounded-md text-[11px] font-extrabold tabular-nums ${
+                                          stockVal
+                                            ? "bg-sky-50 text-sky-700"
+                                            : "bg-slate-100 text-slate-400"
+                                        }`}
+                                      >
+                                        {formatAmount(stockVal)}
+                                      </span>
+                                    )}
+                                    {!isSales && stockCost !== undefined && (
+                                      <span
+                                        title={exactAmount(stockCost)}
+                                        className={`px-1.5 py-0.5 rounded-md text-[11px] font-extrabold tabular-nums ${
+                                          stockCost
+                                            ? "bg-slate-200 text-slate-600"
+                                            : "bg-slate-100 text-slate-400"
+                                        }`}
+                                      >
+                                        {formatAmount(stockCost)}
                                       </span>
                                     )}
                                   </div>
@@ -1590,7 +1588,7 @@ export default function DashboardPage() {
                           prices, so an unvalued date shows nothing here rather
                           than an authoritative Rs 0. Cost is admin-only and
                           simply absent from the response otherwise. */}
-                      {isSales && cat.saleValue != null && (
+                      {!isSales && cat.saleValue != null && (
                         <div className="flex items-center justify-between px-3.5 py-2.5 bg-gradient-to-r from-sky-500/15 via-blue-500/10 to-sky-500/5 border border-sky-500/30 rounded-2xl transition-all shadow-[0_2px_8px_rgba(14,165,233,0.04)]">
                           <span className="flex items-center gap-2 text-xs font-extrabold text-sky-900 uppercase tracking-wide">
                             <span className="w-2.5 h-2.5 rounded-full bg-sky-600 shadow-[0_0_8px_rgba(14,165,233,0.7)]"></span>
@@ -1605,7 +1603,7 @@ export default function DashboardPage() {
                         </div>
                       )}
 
-                      {isSales && cat.costValue != null && (
+                      {!isSales && cat.costValue != null && (
                         <div className="flex items-center justify-between px-3.5 py-2.5 bg-gradient-to-r from-slate-500/15 via-slate-400/10 to-slate-500/5 border border-slate-400/30 rounded-2xl transition-all shadow-[0_2px_8px_rgba(100,116,139,0.04)]">
                           <span className="flex items-center gap-2 text-xs font-extrabold text-slate-800 uppercase tracking-wide">
                             <span className="w-2.5 h-2.5 rounded-full bg-slate-500 shadow-[0_0_8px_rgba(100,116,139,0.6)]"></span>
