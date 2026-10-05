@@ -28,6 +28,12 @@ export const COL = {
   COVERAGE: "snapshot_coverage",
   DAILY_CUBE: "daily_cube",
   STOCK_CUBE: "stock_cube",
+  // Stock history one level deeper than STOCK_CUBE. Kept as its own collection
+  // rather than a sub-category dimension on STOCK_CUBE: that would multiply
+  // every existing row ~19x (789 sub-categories against 41 categories) and
+  // change the _id of a collection the first-level view reads on every
+  // request. Additive is cheaper and cannot regress what already works.
+  SUB_STOCK_CUBE: "subcategory_stock_cube",
   BATCHES: "upload_batches",
   META: "meta",
   USERS: "users",
@@ -44,6 +50,7 @@ export const STAGE = {
   [COL.INVENTORY_STATE]: "stage_inventory_state",
   [COL.SALES_FACTS]: "stage_sales_facts",
   [COL.STOCK_CUBE]: "stage_stock_cube",
+  [COL.SUB_STOCK_CUBE]: "stage_subcategory_stock_cube",
 };
 
 /**
@@ -193,6 +200,7 @@ async function applySchema(db) {
   await create(COL.COVERAGE, null);
   await create(COL.DAILY_CUBE, null);
   await create(COL.STOCK_CUBE, null);
+  await create(COL.SUB_STOCK_CUBE, null);
   await create(COL.BATCHES, null);
   await create(COL.META, null);
 
@@ -260,6 +268,9 @@ async function applySchema(db) {
     // resolves which snapshot to use, then filters within it.
     index(COL.STOCK_CUBE, { date: 1, branch: 1, type: 1, sellingStatus: 1 }),
     index(COL.STOCK_CUBE, { date: 1, branch: 1, category: 1 }),
+    // Level 2 reads this for one category on one date; branch is next because
+    // the "ALL" row is what an unfiltered view wants.
+    index(COL.SUB_STOCK_CUBE, { date: 1, category: 1, branch: 1 }),
     index(COL.DAILY_CUBE, { branch: 1, category: 1, date: 1 }),
     index(COL.COVERAGE, { date: 1, branch: 1 }),
     // A file may only be ingested once — but only a COMMITTED batch reserves its

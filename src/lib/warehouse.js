@@ -793,6 +793,22 @@ export async function snapshotDates(database) {
 }
 
 /**
+ * The snapshot `inventory_state` actually holds.
+ *
+ * It holds exactly one: each inventory upload renames staging over the whole
+ * collection, so yesterday's per-product readings are gone. `stock_cube` keeps
+ * history, which is why a back-dated range can resolve to a snapshot that only
+ * the cube can answer for — the aggregate totals exist, the per-product rows
+ * behind them do not.
+ */
+export async function heldStockDate(database) {
+  const row = await database
+    .collection(COL.INVENTORY_STATE)
+    .findOne({}, { projection: { asOf: 1 } });
+  return row?.asOf ?? null;
+}
+
+/**
  * The snapshot a stock figure should come from for a given end date: the newest
  * one at or before it, or the newest overall when no end date is given.
  */
@@ -898,7 +914,26 @@ export async function readProducts({
   // makes the three levels agree: if the newest snapshot at or before `to` is
   // not the one held, this level has no per-product stock for that date and
   // says so, rather than quietly showing today's count under an older date.
-  const stockDate = await resolveStockDate(database, to);
+  // Product stock is ALWAYS the latest count, whatever the date filter says —
+  // the client's decision, and the only one the data can honour: each upload
+  // renames staging over inventory_state, so a past date has no per-product
+  // rows to return. Deliberately NOT resolveStockDate() here: resolving to the
+  // filter's end date found nothing and every product read 0.
+  //
+  // Sales still reflect the selected range. The two therefore answer different
+  // questions, so the response names the stock date and flags that it is the
+  // latest rather than the filtered one, for the UI to say so.
+  const [filterStockDate, heldAsOf] = await Promise.all([
+    resolveStockDate(database, to),
+    heldStockDate(database),
+  ]);
+  const stockDate = heldAsOf;
+  const stockKnown = Boolean(stockDate);
+  // True when the filter asked for an earlier position than the one shown.
+  const stockIsLatest =
+    Boolean(stockDate) &&
+    Boolean(filterStockDate) &&
+    filterStockDate.getTime() !== stockDate.getTime();
   const stockMatch = { asOf: stockDate };
   if (pCategory !== undefined) stockMatch.category = pCategory;
   if (pSub !== undefined) stockMatch.subCategory = pSub;
@@ -970,7 +1005,7 @@ export async function readProducts({
     // Kept per branch, not summed, so each product can show where its stock is.
     // Skipped outright when no snapshot covers the range — an $in over every
     // barcode is not worth issuing to match nothing.
-    stockDate
+    stockKnown
       ? database
           .collection(COL.INVENTORY_STATE)
           .aggregate([
@@ -1090,7 +1125,7 @@ export async function readProducts({
   const visible = searched.filter(
     productMatchesMetric(metricFilter, {
       branchesCovered: branch === ALL ? (branchCount.length || BRANCH_CODES.length) : 1,
-      stockKnown: Boolean(stockDate),
+      stockKnown,
       inCatalogue: (barcode) => meta.has(barcode),
     })
   );
@@ -1155,7 +1190,13 @@ export async function readProducts({
 
   // Unknown, not zero — same reasoning as levels 1 and 2. Without this every
   // product looked out of stock whenever the range predated the snapshot.
-  if (!stockDate) {
+  if (!stockKnown) {
+    // The per-product figures too, not just the headline. Left at the slot's
+    // default 0 each card claimed "Stock: 0" for a date it had no reading for.
+    for (const p of all) {
+      p.stock = null;
+      p.branchStock = {};
+    }
     stats.totalInventory = null;
     stats.negativeStock = null;
     stats.zeroStock = null;
@@ -1189,7 +1230,17 @@ export async function readProducts({
     total,
     page,
     pageSize,
-    stockDate: stockDate ? dateSlug(stockDate) : null,
+    // Reported honestly: a date is named only when the figures really come
+    // from it. `stockHistoryLimited` separates "no snapshot covers this range"
+    // from "a snapshot exists but only its totals survive" — different causes
+    // with different fixes, and the UI wording differs accordingly.
+    stockDate: stockKnown ? dateSlug(stockDate) : null,
+    stockAvailable: stockKnown,
+    // Never "limited" at this level any more: stock is the latest count, which
+    // always exists. The flag below is what the UI labels instead.
+    stockHistoryLimited: false,
+    stockIsLatest,
+    heldStockDate: heldAsOf ? dateSlug(heldAsOf) : null,
   };
 }
 
@@ -1263,7 +1314,22 @@ export async function readDashboard({
   // Newest snapshot at or before the end of the range; the newest overall when
   // no range is set. Null means no snapshot exists that early, in which case
   // stock figures are omitted rather than silently showing a later count.
-  const stockDate = await resolveStockDate(database, to);
+  // Stock is the LATEST count at every level, not the position on the filter's
+  // end date — the client's decision, and it keeps the three levels able to
+  // reconcile: categories, sub-categories and products all describe the same
+  // moment, so a drill-down adds up. Sales continue to reflect the range.
+  //
+  // The filter's own resolution is still computed, solely to tell whether the
+  // two differ, so the UI can say which date the stock figure belongs to.
+  const [filterStockDate, heldAsOf] = await Promise.all([
+    resolveStockDate(database, to),
+    heldStockDate(database),
+  ]);
+  const stockDate = heldAsOf;
+  const stockIsLatest =
+    Boolean(stockDate) &&
+    Boolean(filterStockDate) &&
+    filterStockDate.getTime() !== stockDate.getTime();
 
   // stock_cube stores a pre-aggregated branch:"ALL" row so product counts are
   // not double-counted across branches. That row is only usable when the view
@@ -1345,7 +1411,61 @@ export async function readDashboard({
   const salesGroupField = drilled ? "$subCategory" : "$category";
 
   const noMatches = (barcodeFilter !== null && barcodeFilter.length === 0) || outOfScope;
-  const noStock = noMatches || !stockDate;
+  // The cube carries history, so it can answer for any snapshot. inventory_state
+  // cannot — see readProducts. Which source this view uses therefore decides
+  // whether a back-dated range has a stock answer at all.
+  const stateStockUsable =
+    Boolean(heldAsOf) && Boolean(stockDate) && stockDate.getTime() === heldAsOf.getTime();
+
+  // CURRENTLY UNREACHABLE, and kept deliberately: with stock pinned to the
+  // latest count above, `stateStockUsable` is always true whenever a snapshot
+  // exists, so this branch cannot be selected. It is the path a point-in-time
+  // view would take, and subcategory_stock_cube is accumulating the history it
+  // needs on every upload — restoring that view means sourcing `stockDate`
+  // from the filter again, nothing more.
+  //
+  // Drilled into a category on a date inventory_state no longer holds, the
+  // sub-category cube answers instead — it keeps history precisely because it
+  // is merged per date rather than replaced. It cannot serve a scope narrowed
+  // to individual products (no barcode dimension), nor a subset of several
+  // branches, where summing per-branch rows would count a product once per
+  // branch — the same reason the first level reads the "ALL" row.
+  //
+  // Existence is checked, not assumed: the cube only has rows from the upload
+  // that first wrote it onward. Querying a date it never covered returns an
+  // empty result, which would land as zeros — the exact wrong answer this
+  // whole path exists to avoid. One extra read, and only on a back-dated
+  // drill-down.
+  const subCubeUsable =
+    drilled &&
+    Boolean(stockDate) &&
+    !stateStockUsable &&
+    productCond === undefined &&
+    (branchIn === null || branchIn.length === 1) &&
+    Boolean(
+      await database
+        .collection(COL.SUB_STOCK_CUBE)
+        .findOne({ date: stockDate }, { projection: { _id: 1 } })
+    );
+
+  const stockSource = !stockDate
+    ? "none"
+    : !useStateForStock
+      ? "cube"
+      : stateStockUsable
+        ? "state"
+        : subCubeUsable
+          ? "subcube"
+          : "none";
+
+  const stockKnown = stockSource !== "none";
+  const noStock = noMatches || !stockKnown;
+
+  const subStockMatch = { date: stockDate, branch: branchIn === null ? ALL : branchIn?.[0] };
+  if (categoryCond !== undefined) subStockMatch.category = categoryCond;
+  if (type !== ALL) subStockMatch.type = type;
+  if (sellingStatus !== ALL) subStockMatch.sellingStatus = sellingStatus;
+  if (subCond !== undefined) subStockMatch.subCategory = subCond;
 
   // Fetched up front, not alongside the aggregations: dead stock needs the last
   // sale date to know whether it can take its cheap path, and waiting for the
@@ -1386,7 +1506,34 @@ export async function readDashboard({
             },
           ])
           .toArray(),
-    noStock ? Promise.resolve([]) : useStateForStock
+    noStock
+      ? Promise.resolve([])
+      : stockSource === "subcube"
+      ? database
+          .collection(COL.SUB_STOCK_CUBE)
+          .aggregate([
+            { $match: subStockMatch },
+            {
+              // Same shape the first-level cube returns, so the merge below
+              // treats both identically — only the state path differs.
+              $group: {
+                _id: "$subCategory",
+                productCount: { $sum: "$productCount" },
+                totalInventory: { $sum: "$totalQty" },
+                negativeStockCount: { $sum: "$negativeStockCount" },
+                zeroStockCount: { $sum: "$zeroStockCount" },
+                ...(includeValuation
+                  ? {
+                      costValue: { $sum: { $ifNull: ["$costValue", 0] } },
+                      saleValue: { $sum: { $ifNull: ["$saleValue", 0] } },
+                      valuedRows: { $sum: { $cond: [{ $gt: ["$saleValue", 0] }, 1, 0] } },
+                    }
+                  : {}),
+              },
+            },
+          ])
+          .toArray()
+      : stockSource === "state"
       ? database
           .collection(COL.INVENTORY_STATE)
           .aggregate([
@@ -1505,7 +1652,7 @@ export async function readDashboard({
   // non-zero reading read zero. At level 2 that needs the full product count per
   // sub-category, which only `products` knows.
   let subProductCounts = new Map();
-  if (useStateForStock && !noMatches) {
+  if (stockSource === "state" && !noMatches) {
     const q = { stockAsOf: { $ne: null } };
     if (categoryCond !== undefined) q.category = categoryCond;
     if (type !== ALL) q.type = type;
@@ -1561,7 +1708,7 @@ export async function readDashboard({
     // Keyed off the same switch that chose the source. Reading the cube's shape
     // from an inventory_state result left productCount undefined, which surfaced
     // as a null product count the moment any scope was applied.
-    if (useStateForStock) {
+    if (stockSource === "state") {
       const total = subProductCounts.get(s._id ?? "") ?? s.withStock ?? 0;
       // Zero somewhere = not stocked at every covered branch. For a single
       // branch that reduces to "has no reading here", which is the same thing.
@@ -1585,7 +1732,7 @@ export async function readDashboard({
 
   // A sub-category can have products but no stock rows at all — it still needs
   // a row, with everything at zero, rather than being absent.
-  if (useStateForStock) {
+  if (stockSource === "state") {
     for (const [sub, total] of subProductCounts) {
       const t = slot(sub);
       if (t.productCount === 0) {
@@ -1600,7 +1747,7 @@ export async function readDashboard({
   // "zero stock" equal the product count exactly and told the user 512 items
   // were out of stock when nothing had been counted at all. Null lets the UI
   // show a dash instead of a made-up figure.
-  if (!stockDate) {
+  if (!stockKnown) {
     for (const c of merged.values()) {
       c.totalInventory = null;
       c.negativeStockCount = null;
@@ -1661,7 +1808,7 @@ export async function readDashboard({
   }
 
   // The headline cards get the same treatment, for the same reason.
-  if (!stockDate) {
+  if (!stockKnown) {
     stats.totalInventory = null;
     stats.negativeStock = null;
     stats.zeroStock = null;
@@ -1689,8 +1836,17 @@ export async function readDashboard({
     dateFiltered: Boolean(from || to),
     // Which snapshot the stock figures came from, so the UI can name it rather
     // than implying stock covers the same range as sales.
-    stockDate: stockDate ? dateSlug(stockDate) : null,
-    stockAvailable: Boolean(stockDate),
+    // Reported honestly: a date is named only when the figures really come
+    // from it. `stockHistoryLimited` separates "no snapshot covers this range"
+    // from "a snapshot exists but only its totals survive" — different causes
+    // with different fixes, and the UI wording differs accordingly.
+    stockDate: stockKnown ? dateSlug(stockDate) : null,
+    stockAvailable: stockKnown,
+    // Pinned to the latest count, so a range can no longer resolve to a
+    // snapshot this level cannot serve.
+    stockHistoryLimited: false,
+    stockIsLatest,
+    heldStockDate: heldAsOf ? dateSlug(heldAsOf) : null,
     stats,
     categories,
     filtersList: {
@@ -1749,7 +1905,7 @@ export async function beginBatch({ database, fileType }) {
   const targets =
     fileType === "sale"
       ? [COL.SALES_FACTS]
-      : [COL.INVENTORY_STATE, COL.STOCK_CUBE];
+      : [COL.INVENTORY_STATE, COL.STOCK_CUBE, COL.SUB_STOCK_CUBE];
 
   // Dropped rather than emptied: a leftover staging collection from an
   // abandoned run would otherwise merge into this one.
@@ -1844,11 +2000,17 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
   const coverage = new Map();
   const stateDocs = [];
   const cube = new Map();
-  const bump = (id, base, field, by) => {
-    let hit = cube.get(id);
-    if (!hit) { hit = { base, inc: {} }; cube.set(id, hit); }
+  // The same totals one level deeper. Accumulated here rather than derived
+  // later because the sheet is the only place the sub-category of a row and
+  // its quantity are both in hand — inventory_state keeps one snapshot, so a
+  // date that has passed can never be recomputed.
+  const subCube = new Map();
+  const into = (map, id, base, field, by) => {
+    let hit = map.get(id);
+    if (!hit) { hit = { base, inc: {} }; map.set(id, hit); }
     hit.inc[field] = (hit.inc[field] ?? 0) + by;
   };
+  const bump = (id, base, field, by) => into(cube, id, base, field, by);
 
   for (const r of rows) {
     const category = r.product.category || UNCATEGORIZED;
@@ -1875,16 +2037,24 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
       const qty = cell?.qty ?? 0;
       const id = `${day}|${branch}|${category}|${type}|${status}`;
       const base = { date: asOf, branch, category, type, sellingStatus: status };
+      const subId = `${day}|${branch}|${category}|${subCategory}|${type}|${status}`;
+      const subBase = { ...base, subCategory };
+      const sub = (field, by) => into(subCube, subId, subBase, field, by);
       // Every covered product counts toward every branch's row, whether or not
       // it has stock there — that is what makes zero-stock derivable.
       bump(id, base, "productCount", 1);
+      sub("productCount", 1);
       if (qty !== 0) {
         bump(id, base, "nonZero", 1);
         bump(id, base, "totalQty", qty);
-        if (qty < 0) bump(id, base, "negativeStockCount", 1);
+        sub("nonZero", 1);
+        sub("totalQty", qty);
+        if (qty < 0) { bump(id, base, "negativeStockCount", 1); sub("negativeStockCount", 1); }
         if (qty > 0) {
           bump(id, base, "costValue", qty * costPrice);
           bump(id, base, "saleValue", qty * saleRate);
+          sub("costValue", qty * costPrice);
+          sub("saleValue", qty * saleRate);
           productCostValue += qty * costPrice;
           productSaleValue += qty * saleRate;
         }
@@ -1902,15 +2072,25 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
 
     const allId = `${day}|${ALL}|${category}|${type}|${status}`;
     const allBase = { date: asOf, branch: ALL, category, type, sellingStatus: status };
+    const allSubId = `${day}|${ALL}|${category}|${subCategory}|${type}|${status}`;
+    const allSubBase = { ...allBase, subCategory };
+    const allSub = (field, by) => into(subCube, allSubId, allSubBase, field, by);
     bump(allId, allBase, "productCount", 1);
+    allSub("productCount", 1);
     bump(allId, allBase, "totalQty", productTotal);
+    allSub("totalQty", productTotal);
     // Summed across branches, unlike the counts above: value is additive, so a
     // product held at three branches contributes all three holdings.
     bump(allId, allBase, "costValue", productCostValue);
     bump(allId, allBase, "saleValue", productSaleValue);
-    if (productNegative) bump(allId, allBase, "negativeStockCount", 1);
+    allSub("costValue", productCostValue);
+    allSub("saleValue", productSaleValue);
+    if (productNegative) { bump(allId, allBase, "negativeStockCount", 1); allSub("negativeStockCount", 1); }
     // Out of stock somewhere counts once for the product, not once per branch.
-    if (nonZeroBranches < branches.length) bump(allId, allBase, "zeroStockCount", 1);
+    if (nonZeroBranches < branches.length) {
+      bump(allId, allBase, "zeroStockCount", 1);
+      allSub("zeroStockCount", 1);
+    }
   }
 
   // Coverage is tiny and keyed by (date, branch), so it is written straight
@@ -1927,14 +2107,18 @@ async function writeInventoryChunk({ database, rows, batchId, dates, isNewer, br
     { ordered: false }
   );
 
-  await chunk([...cube.entries()], 500, (batch) =>
-    database.collection(STAGE[COL.STOCK_CUBE]).bulkWrite(
-      batch.map(([_id, { base, inc }]) => ({
-        updateOne: { filter: { _id }, update: { $setOnInsert: base, $inc: inc }, upsert: true },
-      })),
-      { ordered: false }
-    )
-  );
+  const stageCube = (entries, collection) =>
+    chunk(entries, 500, (batch) =>
+      database.collection(collection).bulkWrite(
+        batch.map(([_id, { base, inc }]) => ({
+          updateOne: { filter: { _id }, update: { $setOnInsert: base, $inc: inc }, upsert: true },
+        })),
+        { ordered: false }
+      )
+    );
+
+  await stageCube([...cube.entries()], STAGE[COL.STOCK_CUBE]);
+  await stageCube([...subCube.entries()], STAGE[COL.SUB_STOCK_CUBE]);
 
   if (!isNewer) return { rows: rows.length, written: 0 };
 
@@ -1977,21 +2161,25 @@ export async function finishBatch({ database, fileType, dates, batchId }) {
     const date = dates[0];
     const stateStage = STAGE[COL.INVENTORY_STATE];
     const cubeStage = STAGE[COL.STOCK_CUBE];
+    const subStage = STAGE[COL.SUB_STOCK_CUBE];
 
     // Branch-level zero stock is productCount - nonZero, which only holds once
     // every batch has landed. The ALL rows already carry their own figure.
-    await database.collection(cubeStage).updateMany(
-      { branch: { $ne: ALL } },
-      [
-        {
-          $set: {
-            zeroStockCount: {
-              $max: [0, { $subtract: ["$productCount", { $ifNull: ["$nonZero", 0] }] }],
+    const deriveZeroStock = (collection) =>
+      database.collection(collection).updateMany(
+        { branch: { $ne: ALL } },
+        [
+          {
+            $set: {
+              zeroStockCount: {
+                $max: [0, { $subtract: ["$productCount", { $ifNull: ["$nonZero", 0] }] }],
+              },
             },
           },
-        },
-      ]
-    );
+        ]
+      );
+    await deriveZeroStock(cubeStage);
+    await deriveZeroStock(subStage);
 
     // Build the indexes on staging before the swap, so the collection is
     // indexed the moment it becomes live.
@@ -2004,13 +2192,19 @@ export async function finishBatch({ database, fileType, dates, batchId }) {
     // The swap. Everything above this line is reversible by dropping staging.
     await database.collection(stateStage).rename(COL.INVENTORY_STATE, { dropTarget: true });
 
-    // The cube keeps other dates, so it is merged rather than renamed.
-    await database.collection(COL.STOCK_CUBE).deleteMany({ date });
-    await database
-      .collection(cubeStage)
-      .aggregate([{ $merge: { into: COL.STOCK_CUBE, whenMatched: "replace", whenNotMatched: "insert" } }], { maxTimeMS: 0 })
-      .toArray();
-    await database.collection(cubeStage).drop().catch(() => {});
+    // The cubes keep other dates, so they are merged rather than renamed. This
+    // is what gives stock a history at all: inventory_state is replaced whole,
+    // these are not.
+    const mergeCube = async (stage, target) => {
+      await database.collection(target).deleteMany({ date });
+      await database
+        .collection(stage)
+        .aggregate([{ $merge: { into: target, whenMatched: "replace", whenNotMatched: "insert" } }], { maxTimeMS: 0 })
+        .toArray();
+      await database.collection(stage).drop().catch(() => {});
+    };
+    await mergeCube(cubeStage, COL.STOCK_CUBE);
+    await mergeCube(subStage, COL.SUB_STOCK_CUBE);
   }
   await rebuildMeta();
 }
@@ -2020,7 +2214,7 @@ export async function discardStaging({ database, fileType, dates }) {
   const names =
     fileType === "sale"
       ? [STAGE[COL.SALES_FACTS]]
-      : [STAGE[COL.INVENTORY_STATE], STAGE[COL.STOCK_CUBE]];
+      : [STAGE[COL.INVENTORY_STATE], STAGE[COL.STOCK_CUBE], STAGE[COL.SUB_STOCK_CUBE]];
   for (const name of names) {
     await database.collection(name).drop().catch(() => {});
   }

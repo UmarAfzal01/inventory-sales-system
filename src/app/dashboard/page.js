@@ -157,6 +157,14 @@ export default function DashboardPage() {
   const [dateFiltered, setDateFiltered] = useState(false);
   const [stockDate, setStockDate] = useState(null);
   const [stockAvailable, setStockAvailable] = useState(true);
+  // A snapshot covers the range, but only its cube totals survive — the
+  // per-product rows were replaced by a later upload. Distinct from having no
+  // snapshot at all, because the remedy the user needs is different.
+  const [stockHistoryLimited, setStockHistoryLimited] = useState(false);
+  const [heldStockDate, setHeldStockDate] = useState(null);
+  // Product stock is the latest count, not the filtered date. True only when
+  // those differ, so the label stays quiet when they agree.
+  const [stockIsLatest, setStockIsLatest] = useState(false);
   const [dateBounds, setDateBounds] = useState({
     minDate: null,
     maxDate: null,
@@ -234,6 +242,9 @@ export default function DashboardPage() {
           if (res.stats) setStats(res.stats);
           setStockDate(res.stockDate ?? null);
           setStockAvailable(Boolean(res.stockDate));
+          setStockHistoryLimited(Boolean(res.stockHistoryLimited));
+          setHeldStockDate(res.heldStockDate ?? null);
+          setStockIsLatest(Boolean(res.stockIsLatest));
           setSetupNeeded(false);
           return;
         }
@@ -246,6 +257,9 @@ export default function DashboardPage() {
         setDateFiltered(Boolean(res.dateFiltered));
         setStockDate(res.stockDate ?? null);
         setStockAvailable(res.stockAvailable !== false);
+        setStockHistoryLimited(Boolean(res.stockHistoryLimited));
+        setHeldStockDate(res.heldStockDate ?? null);
+        setStockIsLatest(Boolean(res.stockIsLatest));
         setDateBounds({
           minDate: res.filtersList?.minDate ?? null,
           maxDate: res.filtersList?.maxDate ?? null,
@@ -828,9 +842,20 @@ export default function DashboardPage() {
                   key={p.label}
                   type="button"
                   onClick={() => {
-                    const end = dateBounds.maxDate
+                    // Anchored on the newest data so a preset lands on days
+                    // that have figures — but never past today. A sheet
+                    // carrying future dates (a MONTH column parsed into the
+                    // wrong year) otherwise dragged every preset with it:
+                    // "Last 7 days" resolved to a week two months ahead.
+                    const now = new Date();
+                    const today = new Date(
+                      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+                    );
+                    const latest = dateBounds.maxDate
                       ? new Date(dateBounds.maxDate)
-                      : new Date();
+                      : null;
+                    const end =
+                      latest && latest.getTime() < today.getTime() ? latest : today;
                     const start = new Date(end);
                     if (p.months) start.setUTCMonth(start.getUTCMonth() - p.months);
                     else start.setUTCDate(start.getUTCDate() - (p.days - 1));
@@ -880,9 +905,26 @@ export default function DashboardPage() {
 
           {!isSales &&
             dateFiltered &&
-            (stockAvailable ? (
+            // stockIsLatest first: stock EXISTS in that case, so testing
+            // stockAvailable ahead of it would always win and the figure would
+            // be presented as if it followed the date filter.
+            (stockIsLatest ? (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mt-3">
+                Sales reflect the selected dates. Stock is the latest count
+                {stockDate ? ` (${stockDate})` : ""}.
+              </p>
+            ) : stockAvailable ? (
               <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mt-3">
                 Sales reflect the selected dates. Stock as at {stockDate}.
+              </p>
+            ) : stockHistoryLimited ? (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mt-3">
+                Sales reflect the selected dates. Stock is counted fresh each
+                upload and only the latest count is kept per product
+                {heldStockDate ? ` (${heldStockDate})` : ""}, so per-product and
+                sub-category stock cannot be shown for an earlier date. Clear
+                the dates, or set the end date to {heldStockDate || "today"}, to
+                see stock.
               </p>
             ) : (
               <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2 mt-3">
@@ -939,7 +981,7 @@ export default function DashboardPage() {
               <h3
                 className={`text-xs font-extrabold uppercase tracking-wider ${activeMetricFilter === "totalSales" ? "text-indigo-100" : "text-indigo-700"}`}
               >
-                {isSales ? "Units Sold (Net)" : "Total Sales (Net)"}
+                {isSales ? "Units Sold (Net)" : "Total Sales (Qty)"}
               </h3>
               <p
                 className={`${metricValueClass(stats.totalSales)} font-black mt-2 tabular-nums leading-tight whitespace-nowrap ${activeMetricFilter === "totalSales" ? "text-white" : "text-slate-900"}`}
@@ -1235,6 +1277,7 @@ export default function DashboardPage() {
                     <span className="font-medium text-slate-500">
                       {" "}
                       · stock as at {productData.stockDate}
+                      {productData.stockIsLatest ? " (latest count)" : ""}
                     </span>
                   )}
                 </p>
@@ -1322,21 +1365,32 @@ export default function DashboardPage() {
                                 <span className="text-indigo-400">Sold: </span>
                                 {Math.round(p.sale).toLocaleString()}
                               </span>
+                              {/* null = no per-product reading for the
+                                  resolved snapshot. Printing 0 claimed the
+                                  shelf was empty on a date nobody counted. */}
                               <span
                                 className={`px-2.5 py-1 rounded-full text-[11px] font-extrabold tabular-nums ${
-                                  p.stock < 0
-                                    ? "bg-rose-50 border border-rose-200 text-rose-700"
-                                    : "bg-emerald-50 border border-emerald-100 text-emerald-700"
+                                  p.stock == null
+                                    ? "bg-slate-100 border border-slate-200 text-slate-500"
+                                    : p.stock < 0
+                                      ? "bg-rose-50 border border-rose-200 text-rose-700"
+                                      : "bg-emerald-50 border border-emerald-100 text-emerald-700"
                                 }`}
                               >
                                 <span
                                   className={
-                                    p.stock < 0 ? "text-rose-400" : "text-emerald-500/80"
+                                    p.stock == null
+                                      ? "text-slate-400"
+                                      : p.stock < 0
+                                        ? "text-rose-400"
+                                        : "text-emerald-500/80"
                                   }
                                 >
                                   Stock:{" "}
                                 </span>
-                                {Math.round(p.stock).toLocaleString()}
+                                {p.stock == null
+                                  ? "—"
+                                  : Math.round(p.stock).toLocaleString()}
                               </span>
                               {/* Null, not zero, when the snapshot behind
                                   this product carries no prices. */}
